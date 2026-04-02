@@ -1,0 +1,102 @@
+
+
+# Ativar o SSH do usuário RSYNC
+passwd -u rsync
+
+# Ativar o Shell Bash
+usermod -s /bin/bash rsync
+
+# Criar o Diretório
+mkdir -p /home/rsync/.ssh
+chmod 700 /home/rsync/.ssh
+
+
+# Gerar a chave
+ssh-keygen -t rsa -b 4096 -f /home/rsync/.ssh/id_rsa -C "rsync@ha"
+
+# Garantir diretório .ssh
+mkdir -p /home/rsync/.ssh
+
+# Adicionar chave pública
+cat /home/rsync/.ssh/id_rsa.pub colar no > /home/rsync/.ssh/authorized_keys do NODE1 / O MESMO PROCESSO PARA O NODE2 com a chave do NODE1
+
+# Permissões corretas
+chmod 700 /home/rsync/.ssh
+chmod 600 /home/rsync/.ssh/authorized_keys
+chown -R rsync:rsync /home/rsync/.ssh
+
+
+
+
+
+# ═══════════════════════════════════════════════════════════
+# NODE1 (A) — 10.11.12.81
+# Executado pelo usuário rsync via SSH remoto do node2
+# ═══════════════════════════════════════════════════════════
+
+# NO NODE1
+echo "rsync ALL=(root) NOPASSWD: /usr/local/rbenv/shims/ruby *" >> /etc/sudoers.d/pg-failover-remote
+visudo -c && echo "OK"
+
+
+cat > /etc/sudoers.d/pg-failover-remote << 'EOF'
+Defaults:rsync !requiretty
+rsync ALL=(root) NOPASSWD: /usr/bin/systemctl stop postgresql-16
+rsync ALL=(root) NOPASSWD: /usr/bin/systemctl start postgresql-16
+rsync ALL=(root) NOPASSWD: /bin/systemctl stop postgresql-16
+rsync ALL=(root) NOPASSWD: /bin/systemctl start postgresql-16
+rsync ALL=(root) NOPASSWD: /usr/bin/runuser *
+rsync ALL=(root) NOPASSWD: /sbin/runuser *
+rsync ALL=(root) NOPASSWD: /usr/bin/timeout *
+rsync ALL=(root) NOPASSWD: /bin/timeout *
+rsync ALL=(root) NOPASSWD: /bin/rm *
+rsync ALL=(root) NOPASSWD: /usr/bin/rm *
+rsync ALL=(root) NOPASSWD: /bin/mkdir *
+rsync ALL=(root) NOPASSWD: /usr/bin/mkdir *
+rsync ALL=(root) NOPASSWD: /bin/chown *
+rsync ALL=(root) NOPASSWD: /usr/bin/chown *
+rsync ALL=(root) NOPASSWD: /bin/chmod *
+rsync ALL=(root) NOPASSWD: /usr/bin/chmod *
+EOF
+chmod 440 /etc/sudoers.d/pg-failover-remote
+visudo -c && echo "NODE1 sudoers OK"
+
+
+
+# ═══════════════════════════════════════════════════════════
+# NODE2 (B) — 10.11.12.239
+# Executado pelo próprio script pg-failover.sh (roda como root)
+# Não precisa de sudoers para o script em si
+#
+# Se tiver patroni-manager / node2-app-manager:
+# ═══════════════════════════════════════════════════════════
+cat > /etc/sudoers.d/patroni-manager << 'EOF'
+Defaults:postgres !requiretty
+postgres ALL=(root) NOPASSWD: /usr/sbin/asterisk *
+postgres ALL=(root) NOPASSWD: /usr/bin/asterisk *
+postgres ALL=(root) NOPASSWD: /usr/bin/pkill *
+postgres ALL=(root) NOPASSWD: /bin/pkill *
+postgres ALL=(root) NOPASSWD: /usr/bin/systemctl stop nginx
+postgres ALL=(root) NOPASSWD: /usr/bin/systemctl start nginx
+postgres ALL=(root) NOPASSWD: /bin/systemctl stop nginx
+postgres ALL=(root) NOPASSWD: /bin/systemctl start nginx
+postgres ALL=(root) NOPASSWD: /usr/local/bin/check_system
+postgres ALL=(root) NOPASSWD: /usr/bin/check_system
+EOF
+chmod 440 /etc/sudoers.d/patroni-manager
+visudo -c && echo "NODE2 sudoers OK"
+
+
+
+
+# Listar sudoers ativos
+ls -la /etc/sudoers.d/
+visudo -c
+
+
+
+
+# Testar no NODE2 — simular o que o script faz
+ssh -i /home/rsync/.ssh/id_rsa rsync@10.11.12.81 \
+  "sudo runuser -u postgres -- /usr/pgsql-16/bin/psql -d postgres -tAc 'SELECT pg_is_in_recovery();'"
+# Esperado: f (master) ou t (replica) — sem pedir senha
