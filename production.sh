@@ -991,7 +991,7 @@ do_failback() {
 
     # Subir servicos em A (check_system) — igual ao que e feito no failover de B
     log_info "  [4/6] Executando check_system em A para subir servicos..."
-    if ssh_a "sudo /usr/local/rbenv/shims/ruby /home/totalip/ipserver/nagios/check_system.rb -v >> /var/log/failover.log 2>&1"; then
+    if ssh_a "check_system >> /var/log/failover.log 2>&1"; then
         log_ok "  [4/6] check_system em A executado com sucesso."
     else
         log_warn "  [4/6] check_system em A retornou erro (nao critico — continuando)."
