@@ -1,0 +1,7 @@
+[Timer]
+OnCalendar=*-*-* 22:05:00
+Persistent=true
+Unit=pg-failover-restart.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,13 @@
+[Unit]
+Description=HA Setup — Configura privilégios mínimos do rsync para pg-failover
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash /home/totalip/hasetup.sh
+StandardOutput=journal
+StandardError=journal
+User=root
+
+[Install]
+WantedBy=multi-user.target
