@@ -1,6 +1,5 @@
 #!/bin/bash
 # pg-failover.sh — Failover + Failback automático PostgreSQL HA (hardened v2)
-# Instalado em: nó B (10.11.12.239)
 # Gerenciado por: pg-failover.service (systemd)
 #
 # REGRAS DE CONEXÃO:
@@ -14,23 +13,31 @@
 #   [3] Verificação de lag=0 antes do failback
 #   [4] Credenciais carregadas de arquivo .env (segurança)
 #   [5] Failback manual recomendado em produção (FAILBACK_NOW=1)
+#
+# MELHORIAS v3 (hardened):
+#   [6] Health check duplo: LAN (DRG) + rede pública
+#       - LAN FAIL + pública OK  → DRG caiu mas A está vivo → alerta, SEM failover
+#       - LAN FAIL + pública FAIL → A confirmado offline → failover normal
+#       - Evita failover indevido por queda isolada do túnel entre sites
+#
+# CORREÇÕES v3.1:
+#   [7] Removidos "local" inválidos do main loop (bug silencioso com set -uo)
+#   [8] get_master_hostname movido para branch "A ONLINE" (evita timeout desnecessário)
+#   [9] check_a_via_public com short-circuit (reduz até 33s extras no RTO em worst case)
+
+
+usermod -aG totalip postgres
 
 set -uo pipefail
 
 ########################################
 # CARREGAR CREDENCIAIS DE ARQUIVO .ENV
-# Crie /etc/pg-failover.env com permissão 600
-# Exemplo de conteúdo:
-#   REPL_PASSWORD='totalipHa'
-#   TELEGRAM_BOT_TOKEN="xxx"
-#   TELEGRAM_CHAT_ID="yyy"
 ########################################
 ENV_FILE="/etc/pg-failover.env"
 if [[ -f "$ENV_FILE" ]]; then
     # shellcheck disable=SC1090
     source "$ENV_FILE"
 else
-    # Fallback para variáveis inline (menos seguro)
     REPL_PASSWORD="${REPL_PASSWORD:-totalipHa}"
     TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-8530438377:AAFRs73B25PMMHKeT-5PbjAj-IF6ZzrjBas}"
     TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-1144847708}"
@@ -39,17 +46,29 @@ fi
 ########################################
 # CONFIG
 ########################################
-MASTER_A_IP="10.11.12.81"
-SLAVE_B_IP="10.11.12.239"
+# IPs privados (LAN — roteados pelo DRG)
+MASTER_A_IP="10.0.0.167"
+SLAVE_B_IP="192.168.0.239"
 
-PGDATA="/var/lib/pgsql/16/data"
-PG_BIN="/usr/pgsql-16/bin"
+# IPs públicos (usados como segunda camada de verificação)
+MASTER_A_PUBLIC_IP="146.235.50.29"
+SLAVE_B_PUBLIC_IP="204.216.167.122"
+
+# ── Versão do PostgreSQL — altere APENAS esta linha ──────────────────────
+PG_VER="13"
+PGDATA="/var/lib/pgsql/${PG_VER}/data"
+PG_BIN="/usr/pgsql-${PG_VER}/bin"
+PG_SERVICE="postgresql-${PG_VER}"
+
+PG_SERVICE="postgresql-${PG_VER}"
+
+PG_SOCKET_DIR="${PG_SOCKET_DIR:-}"
 
 REPL_USER="replytotalip"
 DB_NAME="totalipdb"
-
-# Banco para health checks — sempre existe, funciona em master e replica
 HEALTH_DB="postgres"
+
+CHECK_SYSTEM_CMD="/usr/local/rbenv/shims/ruby /home/totalip/ipserver/nagios/check_system.rb -v"
 
 MY_SLOT="replica2"
 REMOTE_SLOT="replica1"
@@ -68,44 +87,29 @@ SSH_OPTS="-i $SSH_KEY -o IdentitiesOnly=yes -o BatchMode=yes \
           -o StrictHostKeyChecking=no -o ConnectTimeout=5 \
           -o ServerAliveInterval=10 -o ServerAliveCountMax=3"
 
+# SSH opts para rede pública — timeout menor pra não travar o loop
+SSH_OPTS_PUBLIC="-i $SSH_KEY -o IdentitiesOnly=yes -o BatchMode=yes \
+                 -o StrictHostKeyChecking=no -o ConnectTimeout=8 \
+                 -o ServerAliveInterval=5 -o ServerAliveCountMax=2"
+
 BACKUP_DB_DIR="/backup/backup_db"
 
 #--------------------------------------
 # TUNABLES
 #--------------------------------------
-# Quantas falhas consecutivas do health check triplo antes de failover
 FAILOVER_THRESHOLD=3
-
-# Quantos checks saudáveis consecutivos de A antes de permitir failback
 FAILBACK_HEALTH_REQUIRED=4
-
-# Intervalo entre checks (segundos)
 CHECK_INTERVAL=5
-
-# Timeout para pg_basebackup (segundos)
 BASEBACKUP_TIMEOUT=3600
-
-# Espaço mínimo livre em /var/lib/pgsql (MB)
 DISK_MIN_FREE_MB=5120
-
-# Lag máximo aceitável para failover (bytes)
-# Se a replica estiver mais atrasada que isso, não promove
-# 0 = não verificar lag (failover imediato mesmo com dados faltando)
 MAX_LAG_FOR_FAILOVER=1048576   # 1MB
-
-# Lag máximo aceitável para failback (bytes)
-# node1 precisa estar abaixo deste valor antes de executar o failback
 MAX_LAG_FOR_FAILBACK=1048576   # 1MB
 
 #--------------------------------------
 # FAILBACK AGENDADO
 #--------------------------------------
-FAILBACK_SCHEDULE_TIME="02:00"
+FAILBACK_SCHEDULE_TIME="04:00"
 FAILBACK_SCHEDULE_WINDOW_MIN=30
-
-# FAILBACK_NOW=1 → força failback imediato ignorando horário
-# Recomendação: em produção, use FAILBACK_NOW=1 manualmente
-# e mantenha FAILBACK_NOW=0 no script (evita failback automático inesperado)
 FAILBACK_NOW="${FAILBACK_NOW:-0}"
 
 ########################################
@@ -118,9 +122,13 @@ chmod 600 "$FLAG_FAILOVER" "$FLAG_FAILBACK" "$FAILBACK_ERROR_FLAG"
 
 FAILURE_COUNT=0
 MASTER_HEALTH_COUNT=0
-SPLITBRAIN_PROTECTED=0   # 1 = A foi parado por split-brain, nao tentar subir
+SPLITBRAIN_PROTECTED=0
 SLAVE_HOSTNAME=$(hostname)
 MASTER_HOSTNAME="unknown"
+
+# Contador de alertas DRG para evitar flood de mensagens
+DRG_ALERT_COUNT=0
+DRG_ALERT_MAX=3   # envia alerta no primeiro, depois a cada N*CHECK_INTERVAL
 
 ########################################
 # LOG
@@ -143,30 +151,109 @@ send_telegram() {
 }
 
 ########################################
-# METRICAS DO SISTEMA — para Telegram
+# CHECK_SYSTEM
+########################################
+run_check_system_local() {
+    log_info "Encerrando check_system anterior local (se existir)..."
+    pkill -f "check_system.rb" 2>/dev/null || true
+    pkill -f "ruby.*check_system" 2>/dev/null || true
+    sleep 2
+    log_info "Executando check_system local (B)..."
+    if $CHECK_SYSTEM_CMD >> "$LOGFILE" 2>&1; then
+        log_ok "check_system local executado com sucesso."
+    else
+        log_warn "check_system local retornou erro (nao critico)."
+    fi
+}
+
+run_check_system_remote_a() {
+    log_info "Encerrando check_system anterior em A (se existir)..."
+    ssh_a "pkill -f 'check_system.rb' 2>/dev/null; pkill -f 'ruby.*check_system' 2>/dev/null; true" 2>/dev/null || true
+    sleep 2
+    log_info "Executando check_system em A..."
+    if ssh_a "sudo $CHECK_SYSTEM_CMD >> /var/log/failover.log 2>&1"; then
+        log_ok "check_system em A executado com sucesso."
+    else
+        log_warn "check_system em A retornou erro (nao critico)."
+    fi
+}
+
+########################################
+# METRICAS DO SISTEMA
 ########################################
 get_disk_info_local() {
     df -h /var/lib/pgsql 2>/dev/null | awk 'NR==2{printf "%s usado de %s (%s livre)", $3, $2, $4}'
 }
-
 get_disk_info_remote() {
     ssh_a "df -h /var/lib/pgsql 2>/dev/null | awk 'NR==2{printf \"%s usado de %s (%s livre)\", \$3, \$2, \$4}'" 2>/dev/null || echo "N/A"
 }
-
 get_mem_info_local() {
     free -h 2>/dev/null | awk '/^Mem:/{printf "%s usado de %s", $3, $2}'
 }
-
 get_mem_info_remote() {
     ssh_a "free -h 2>/dev/null | awk '/^Mem:/{printf \"%s usado de %s\", \$3, \$2}'" 2>/dev/null || echo "N/A"
 }
-
 get_load_local() {
     uptime 2>/dev/null | awk -F'load average:' '{gsub(/ /,"",$2); print $2}' | cut -d, -f1-3
 }
-
 get_load_remote() {
     ssh_a "uptime 2>/dev/null | awk -F'load average:' '{print \$NF}'" 2>/dev/null || echo "N/A"
+}
+get_cpu_info_local() {
+    top -bn1 2>/dev/null | grep "Cpu(s)" | awk '{printf "%.1f%%", $2 + $4}' || echo "N/A"
+}
+get_cpu_info_remote() {
+    ssh_a "top -bn1 2>/dev/null | grep 'Cpu(s)' | awk '{printf \"%.1f%%\", \$2 + \$4}'" 2>/dev/null || echo "N/A"
+}
+get_uptime_local() {
+    uptime -p 2>/dev/null || uptime 2>/dev/null | awk -F'up ' '{print $2}' | cut -d',' -f1-2 || echo "N/A"
+}
+get_uptime_remote() {
+    ssh_a "uptime -p 2>/dev/null || uptime 2>/dev/null | awk -F'up ' '{print \$2}' | cut -d',' -f1-2" 2>/dev/null || echo "N/A"
+}
+
+send_status_report() {
+    local CONTEXT="${1:-heartbeat}"
+    local ROLE_A ROLE_B
+    local STATE_A STATE_B
+    STATE_A=$(get_pg_state_remote_a)
+    STATE_B=$(get_pg_state_local)
+    case "$STATE_A" in
+        master)  ROLE_A="✅ Master"  ;;
+        replica) ROLE_A="🔄 Réplica" ;;
+        *)       ROLE_A="❌ Offline" ;;
+    esac
+    case "$STATE_B" in
+        master)  ROLE_B="✅ Master"  ;;
+        replica) ROLE_B="🔄 Réplica" ;;
+        *)       ROLE_B="❌ Offline" ;;
+    esac
+    local LAG
+    LAG=$(get_local_wal_lag_bytes 2>/dev/null || echo "N/A")
+    local DISK_A DISK_B MEM_A MEM_B LOAD_A LOAD_B CPU_A CPU_B UP_A UP_B
+    DISK_A=$(get_disk_info_remote); DISK_B=$(get_disk_info_local)
+    MEM_A=$(get_mem_info_remote);   MEM_B=$(get_mem_info_local)
+    LOAD_A=$(get_load_remote);      LOAD_B=$(get_load_local)
+    CPU_A=$(get_cpu_info_remote);   CPU_B=$(get_cpu_info_local)
+    UP_A=$(get_uptime_remote);      UP_B=$(get_uptime_local)
+    send_telegram "📡 *STATUS HA — ${CONTEXT}*
+
+🖥 *Node A:* ${MASTER_HOSTNAME} \`(${MASTER_A_IP} / ${MASTER_A_PUBLIC_IP})\`
+   Modo: ${ROLE_A}
+   Uptime: ${UP_A}
+   💾 Disco: ${DISK_A}
+   🧠 Memória: ${MEM_A}
+   ⚡ Load: ${LOAD_A} | CPU: ${CPU_A}
+
+🖥 *Node B:* ${SLAVE_HOSTNAME} \`(${SLAVE_B_IP} / ${SLAVE_B_PUBLIC_IP})\`
+   Modo: ${ROLE_B}
+   Uptime: ${UP_B}
+   💾 Disco: ${DISK_B}
+   🧠 Memória: ${MEM_B}
+   ⚡ Load: ${LOAD_B} | CPU: ${CPU_B}
+
+📡 *Lag WAL:* ${LAG} bytes
+🕐 ${CONTEXT} | $(timestamp)"
 }
 
 get_pg_version_local() {
@@ -174,30 +261,23 @@ get_pg_version_local() {
         -tAc "SELECT version();" 2>/dev/null | awk '{print $1, $2}' || echo "N/A"
 }
 
-# Calcula duracao em formato legivel (ex: 2h 15m 30s)
 calc_duration() {
     local START="$1"
-    local END
-    END=$(date +%s)
+    local END; END=$(date +%s)
     local DIFF=$(( END - START ))
     local H=$(( DIFF / 3600 ))
     local M=$(( (DIFF % 3600) / 60 ))
     local S=$(( DIFF % 60 ))
-    if [ $H -gt 0 ]; then
-        echo "${H}h ${M}m ${S}s"
-    elif [ $M -gt 0 ]; then
-        echo "${M}m ${S}s"
-    else
-        echo "${S}s"
-    fi
+    if [ $H -gt 0 ]; then echo "${H}h ${M}m ${S}s"
+    elif [ $M -gt 0 ]; then echo "${M}m ${S}s"
+    else echo "${S}s"; fi
 }
 
-# Variaveis de tempo para medir duracao
 FAILOVER_START_TS=0
 FAILBACK_START_TS=0
 
 ########################################
-# SSH
+# SSH — LAN (via DRG)
 ########################################
 ssh_a() {
     ssh $SSH_OPTS "${SSH_USER}@${MASTER_A_IP}" "$@"
@@ -218,18 +298,20 @@ ssh_a_retry() {
     return 1
 }
 
+########################################
+# SSH — Rede pública
+########################################
+ssh_a_public() {
+    ssh $SSH_OPTS_PUBLIC "${SSH_USER}@${MASTER_A_PUBLIC_IP}" "$@"
+}
+
 get_master_hostname() {
     MASTER_HOSTNAME=$(ssh_a "hostname" 2>/dev/null || echo "unknown")
     echo "$MASTER_HOSTNAME"
 }
 
 ########################################
-# HEALTH CHECK TRIPLO: ping + SSH + PostgreSQL
-#
-# Melhoria 1: apenas SSH não é suficiente
-# SSH pode cair por timeout mas PostgreSQL estar OK,
-# ou o servidor pode estar em estado zumbi (kernel panic parcial)
-# O triplo check reduz drasticamente falsos positivos
+# HEALTH CHECK TRIPLO — LAN (DRG)
 ########################################
 check_ping_a() {
     ping -c 2 -W 2 "$MASTER_A_IP" >/dev/null 2>&1
@@ -246,16 +328,65 @@ check_pg_a() {
         -tAc 'SELECT 1' >/dev/null 2>&1" 2>/dev/null
 }
 
-# check_master_online: usado para verificar se A está acessível
-# Usa ping + SSH (rápido, para o loop principal)
+########################################
+# HEALTH CHECK TRIPLO — Rede pública
+#
+# Usa a mesma chave SSH e usuário que o check LAN.
+# ConnectTimeout maior pra tolerar latência pública.
+# check_pg_a_public só é chamado se SSH público responder.
+########################################
+check_ping_a_public() {
+    ping -c 2 -W 3 "$MASTER_A_PUBLIC_IP" >/dev/null 2>&1
+}
+
+check_ssh_a_public() {
+    ssh $SSH_OPTS_PUBLIC \
+        "${SSH_USER}@${MASTER_A_PUBLIC_IP}" "echo ok" >/dev/null 2>&1
+}
+
+check_pg_a_public() {
+    ssh_a_public "sudo runuser -u postgres -- $PG_BIN/psql \
+        -d $HEALTH_DB \
+        -tAc 'SELECT 1' >/dev/null 2>&1" 2>/dev/null
+}
+
+# Retorna 0 se A responde em pelo menos um check pela rede pública
+# Retorna 1 se todos os três falharam pela rede pública
+# Short-circuit: para no primeiro check que passar, evitando timeouts desnecessários
+# quando A já está confirmado vivo (ou confirmado morto)
+check_a_via_public() {
+    if check_ping_a_public; then
+        log_info "Check público — ping OK (A vivo)"
+        return 0
+    fi
+    if check_ssh_a_public; then
+        log_info "Check público — ssh OK (A vivo)"
+        return 0
+    fi
+    if check_pg_a_public; then
+        log_info "Check público — pg OK (A vivo)"
+        return 0
+    fi
+    log_info "Check público — ping/ssh/pg falharam (A offline ou internet de B indisponível)"
+    return 1
+}
+
 check_master_online() {
     check_ping_a && check_ssh_a
 }
 
-# master_confirmed_offline: usado para disparar o failover
-# Requer FAILOVER_THRESHOLD falhas consecutivas do health check triplo
-# Melhoria: inclui verificação de PostgreSQL para evitar failover
-# quando só o SSH caiu mas o banco está OK
+########################################
+# DETECÇÃO DE FALHA COM DISTINÇÃO DRG vs SERVIDOR
+#
+# Lógica:
+#   1. Testa os 3 checks pela LAN (DRG)
+#   2. Se LAN OK em qualquer camada → A está vivo, reseta contador
+#   3. Se LAN FALHOU nos 3 → testa pela rede pública
+#      a. Pública OK → DRG caiu mas A está vivo
+#            → alerta Telegram, reseta contador, NÃO faz failover
+#      b. Pública FAIL → A genuinamente offline
+#            → incrementa contador, failover ao atingir threshold
+########################################
 master_confirmed_offline() {
     local PING_OK=0 SSH_OK=0 PG_OK=0
 
@@ -263,29 +394,67 @@ master_confirmed_offline() {
     check_ssh_a  && SSH_OK=1
     [ $SSH_OK -eq 1 ] && check_pg_a && PG_OK=1
 
+    # LAN ainda responde — tudo normal
     if [ $PING_OK -eq 1 ] || [ $SSH_OK -eq 1 ] || [ $PG_OK -eq 1 ]; then
-        # Pelo menos um check passou — A não está totalmente offline
         if [ $FAILURE_COUNT -gt 0 ]; then
-            log_info "A respondeu parcialmente (ping=$PING_OK ssh=$SSH_OK pg=$PG_OK). Resetando contador."
+            log_info "A respondeu pela LAN (ping=${PING_OK} ssh=${SSH_OK} pg=${PG_OK}). Resetando contador."
         fi
         FAILURE_COUNT=0
+        DRG_ALERT_COUNT=0
         return 1
     fi
 
+    # LAN falhou — verificar pela rede pública antes de decidir
+    log_warn "LAN de A offline (ping=${PING_OK} ssh=${SSH_OK} pg=${PG_OK}) — verificando pela rede pública..."
+
+    if check_a_via_public; then
+        # A está vivo, mas DRG/túnel está fora
+        DRG_ALERT_COUNT=$((DRG_ALERT_COUNT + 1))
+
+        # Envia alerta apenas na primeira detecção e depois periodicamente
+        # para não gerar flood no Telegram
+        if [ "$DRG_ALERT_COUNT" -eq 1 ] || [ $(( DRG_ALERT_COUNT % 12 )) -eq 0 ]; then
+            log_warn "DRG OFFLINE — A (${MASTER_A_PUBLIC_IP}) responde pela internet. Sem failover."
+            send_telegram "⚠️ *ALERTA — DRG / TÚNEL OFFLINE*
+
+🔌 Conectividade LAN entre os sites foi perdida
+✅ *Node A:* ${MASTER_HOSTNAME} (${MASTER_A_PUBLIC_IP}) — respondendo pela internet
+🖥 *Node B:* ${SLAVE_HOSTNAME} (${SLAVE_B_IP}) — aguardando
+
+⛔ *Failover NÃO iniciado* — A está operacional
+🔧 Verifique o DRG / túnel IPSec na OCI
+
+🕐 Horário: $(timestamp)"
+        else
+            log_warn "DRG ainda offline (alerta ${DRG_ALERT_COUNT}) — A vivo pela internet. Aguardando recuperação do túnel."
+        fi
+
+        FAILURE_COUNT=0
+        return 1   # Não failover
+    fi
+
+    # Pública também falhou — A está genuinamente offline
+    DRG_ALERT_COUNT=0
     FAILURE_COUNT=$((FAILURE_COUNT + 1))
-    log_warn "A offline — ping=$PING_OK ssh=$SSH_OK pg=$PG_OK (falha ${FAILURE_COUNT}/${FAILOVER_THRESHOLD})"
+    log_warn "A offline em LAN e rede pública (falha ${FAILURE_COUNT}/${FAILOVER_THRESHOLD})"
     [ "$FAILURE_COUNT" -ge "$FAILOVER_THRESHOLD" ]
 }
 
 ########################################
 # ESTADO POSTGRESQL LOCAL (B)
-# Socket Unix — sem senha, sem -h, sem -U
 ########################################
 get_pg_state_local() {
     local RESULT
-    RESULT=$(runuser -u postgres -- "$PG_BIN/psql" \
+    local SOCK_ARGS=""
+    [ -n "$PG_SOCKET_DIR" ] && SOCK_ARGS="-h $PG_SOCKET_DIR"
+    RESULT=$(runuser -u postgres -- "$PG_BIN/psql" $SOCK_ARGS \
         -d "$HEALTH_DB" \
         -tAc "SELECT pg_is_in_recovery();" 2>/dev/null | tr -d '[:space:]')
+    if [ -z "$RESULT" ] && [ -z "$PG_SOCKET_DIR" ]; then
+        RESULT=$(runuser -u postgres -- "$PG_BIN/psql" -h /tmp \
+            -d "$HEALTH_DB" \
+            -tAc "SELECT pg_is_in_recovery();" 2>/dev/null | tr -d '[:space:]')
+    fi
     case "$RESULT" in
         f) echo "master"  ;;
         t) echo "replica" ;;
@@ -294,8 +463,7 @@ get_pg_state_local() {
 }
 
 get_pg_state() {
-    local S
-    S=$(get_pg_state_local)
+    local S; S=$(get_pg_state_local)
     case "$S" in
         master)  echo "f"     ;;
         replica) echo "t"     ;;
@@ -309,7 +477,6 @@ check_if_promoted() {
 
 ########################################
 # ESTADO POSTGRESQL REMOTO (A)
-# Socket Unix via SSH + sudo — aceita master ou replica
 ########################################
 get_pg_state_remote_a() {
     local RESULT
@@ -325,14 +492,9 @@ get_pg_state_remote_a() {
 
 ########################################
 # VERIFICAÇÃO DE LAG WAL
-#
-# Melhoria 4: verificar lag antes do failover
-# Promover replica atrasada = perda de dados garantida
 ########################################
 get_local_wal_lag_bytes() {
-    # Diferença entre WAL recebido e WAL aplicado (replay)
-    # 0 = totalmente sincronizado
-    runuser -u postgres -- "$PG_BIN/psql" \
+    runuser -u postgres -- "$PG_BIN/psql" ${PG_SOCKET_DIR:+-h $PG_SOCKET_DIR} \
         -d "$HEALTH_DB" \
         -tAc "SELECT COALESCE(
                 pg_wal_lsn_diff(pg_last_wal_receive_lsn(), pg_last_wal_replay_lsn()),
@@ -341,21 +503,15 @@ get_local_wal_lag_bytes() {
 }
 
 check_local_lag_acceptable() {
-    # Verifica se B está suficientemente sincronizado para ser promovido
     if [ "$MAX_LAG_FOR_FAILOVER" -eq 0 ]; then
         log_info "Verificacao de lag desabilitada (MAX_LAG_FOR_FAILOVER=0)"
         return 0
     fi
-
-    local LAG
-    LAG=$(get_local_wal_lag_bytes)
-
-    # Se não conseguiu obter o lag, assumir que está ok (B pode estar em modo master)
+    local LAG; LAG=$(get_local_wal_lag_bytes)
     if ! echo "$LAG" | grep -qE '^[0-9]+$'; then
         log_warn "Nao foi possivel verificar lag. Prosseguindo com failover."
         return 0
     fi
-
     if [ "$LAG" -le "$MAX_LAG_FOR_FAILOVER" ]; then
         log_ok "Lag de B aceitavel: ${LAG} bytes (<= ${MAX_LAG_FOR_FAILOVER})"
         return 0
@@ -366,8 +522,6 @@ check_local_lag_acceptable() {
 }
 
 get_remote_replication_lag() {
-    # Lag de A como replica de B (durante FAILBACK_PENDING)
-    # Retorna bytes de diferença entre B (master) e A (replica)
     runuser -u postgres -- "$PG_BIN/psql" \
         -d "$HEALTH_DB" \
         -tAc "SELECT COALESCE(
@@ -380,20 +534,15 @@ get_remote_replication_lag() {
 }
 
 check_remote_lag_for_failback() {
-    # Verifica se A está sincronizado antes do failback
     if [ "$MAX_LAG_FOR_FAILBACK" -eq 0 ]; then
         log_info "Verificacao de lag para failback desabilitada"
         return 0
     fi
-
-    local LAG
-    LAG=$(get_remote_replication_lag)
-
+    local LAG; LAG=$(get_remote_replication_lag)
     if ! echo "$LAG" | grep -qE '^[0-9]+$'; then
         log_warn "Nao foi possivel verificar lag de A. Abortando failback por seguranca."
         return 1
     fi
-
     if [ "$LAG" -le "$MAX_LAG_FOR_FAILBACK" ]; then
         log_ok "Lag de A aceitavel para failback: ${LAG} bytes"
         return 0
@@ -405,22 +554,25 @@ check_remote_lag_for_failback() {
 
 ########################################
 # TENTAR SUBIR POSTGRESQL EM A
-# Chamado quando A responde SSH mas PostgreSQL está down
 ########################################
 try_start_postgres_remote_a() {
+    local PGDATA_FILES
+    PGDATA_FILES=$(ssh_a "sudo find $PGDATA -mindepth 1 -maxdepth 1 2>/dev/null | wc -l" 2>/dev/null || echo "1")
+    PGDATA_FILES=$(echo "$PGDATA_FILES" | tr -d ' ')
+    if [ "${PGDATA_FILES:-1}" = "0" ]; then
+        log_info "PGDATA em A vazio — nao tentando subir (aguarda failback com basebackup)."
+        SPLITBRAIN_PROTECTED=1
+        return 1
+    fi
     log_info "Tentando iniciar PostgreSQL em A via SSH..."
-
-    if ! ssh_a "sudo systemctl start postgresql-16" 2>/dev/null; then
+    if ! ssh_a "sudo systemctl start $PG_SERVICE" 2>/dev/null; then
         log_warn "Falha ao iniciar PostgreSQL em A via systemctl."
         return 1
     fi
-
-    # Aguardar PostgreSQL aceitar conexões (até 30s)
     local ATTEMPTS=0
     while [ $ATTEMPTS -lt 6 ]; do
         sleep 5
-        local STATE
-        STATE=$(get_pg_state_remote_a)
+        local STATE; STATE=$(get_pg_state_remote_a)
         if [ "$STATE" != "down" ]; then
             log_ok "PostgreSQL em A iniciou como ${STATE}."
             return 0
@@ -428,25 +580,15 @@ try_start_postgres_remote_a() {
         ATTEMPTS=$((ATTEMPTS + 1))
         log_info "Aguardando PostgreSQL em A subir (tentativa ${ATTEMPTS}/6)..."
     done
-
     log_warn "PostgreSQL em A nao respondeu apos 30s."
     return 1
 }
 
 ########################################
 # PROTEGER A CONTRA SPLIT-BRAIN
-#
-# Quando A volta online enquanto B é master, A pode voltar como master
-# se o PostgreSQL foi iniciado manualmente ou se tinha dados anteriores.
-# Isso causa split-brain: dois masters gravando ao mesmo tempo.
-#
-# Solução: assim que A é detectado online, forçar read-only em A
-# e garantir que ele esteja como replica antes do failback.
 ########################################
 protect_node_a_from_splitbrain() {
-    local STATE_A
-    STATE_A=$(get_pg_state_remote_a)
-
+    local STATE_A; STATE_A=$(get_pg_state_remote_a)
     if [ "$STATE_A" = "master" ]; then
         log_warn "SPLIT-BRAIN DETECTADO: A voltou como MASTER enquanto B e master!"
         log_warn "Forcando A em modo read-only para proteger dados de B..."
@@ -455,7 +597,7 @@ protect_node_a_from_splitbrain() {
         _DISK_B=$(get_disk_info_local)
         send_telegram "⚡ *SPLIT-BRAIN DETECTADO*
 
-🖥 *Node A:* ${MASTER_HOSTNAME} (${MASTER_A_IP}) — voltou como MASTER
+🖥 *Node A:* ${MASTER_HOSTNAME} (${MASTER_A_IP} / ${MASTER_A_PUBLIC_IP}) — voltou como MASTER
 🖥 *Node B:* ${SLAVE_HOSTNAME} (${SLAVE_B_IP}) — MASTER ativo
 
 🛡 *Ação automática:*
@@ -468,16 +610,14 @@ protect_node_a_from_splitbrain() {
 
 🕐 Horário: $(timestamp)"
 
-        # 1. Forçar read-only em A via ALTER SYSTEM
         if ssh_a 'sudo runuser -u postgres -- '"$PG_BIN"'/psql -d '"$HEALTH_DB"' -tAc "ALTER SYSTEM SET default_transaction_read_only = on; SELECT pg_reload_conf();" >/dev/null 2>&1'; then
             log_ok "A colocado em read-only. Escrita bloqueada em A."
         else
             log_warn "Nao foi possivel forcar read-only em A via ALTER SYSTEM."
         fi
 
-        # 2. Tentar fazer pg_ctl stop graceful em A para eliminar o risco
         log_warn "Parando PostgreSQL em A para eliminar split-brain..."
-        if ssh_a "sudo systemctl stop postgresql-16" 2>/dev/null; then
+        if ssh_a "sudo systemctl stop $PG_SERVICE" 2>/dev/null; then
             log_ok "PostgreSQL em A parado. Split-brain eliminado."
             SPLITBRAIN_PROTECTED=1
             send_telegram "✅ *SPLIT-BRAIN RESOLVIDO*
@@ -490,7 +630,6 @@ protect_node_a_from_splitbrain() {
             return 0
         else
             log_error "Nao foi possivel parar PostgreSQL em A."
-            log_error "INTERVENCAO MANUAL NECESSARIA em ${MASTER_A_IP}"
             send_telegram "🆘 *URGENTE — SPLIT-BRAIN NÃO RESOLVIDO*
 
 ❌ Não foi possível parar o PostgreSQL em A
@@ -501,39 +640,30 @@ protect_node_a_from_splitbrain() {
 🚨 *INTERVENÇÃO MANUAL IMEDIATA NECESSÁRIA*
 
 Acesse ${MASTER_A_IP} e execute:
-systemctl stop postgresql-16
+systemctl stop $PG_SERVICE
 
 🕐 Horário: $(timestamp)"
             return 1
         fi
     fi
-
     return 0
 }
 
 ########################################
 # SAÚDE DO POSTGRESQL EM A
-# Aceita A como master OU replica
-# Se PostgreSQL estiver down mas SSH OK, tenta subir automaticamente
 ########################################
 check_master_postgres_healthy() {
     if ! check_master_online; then
         MASTER_HEALTH_COUNT=0
         return 1
     fi
-
-    local STATE_A
-    STATE_A=$(get_pg_state_remote_a)
-
+    local STATE_A; STATE_A=$(get_pg_state_remote_a)
     case "$STATE_A" in
         master)
-            # A voltou como master enquanto B é master — split-brain!
-            # Proteger imediatamente antes de prosseguir
             if ! protect_node_a_from_splitbrain; then
                 MASTER_HEALTH_COUNT=0
                 return 1
             fi
-            # Após proteção A está parado — tentar subir como replica
             STATE_A=$(get_pg_state_remote_a)
             if [ "$STATE_A" = "down" ]; then
                 log_info "A parado apos protecao split-brain. Aguardando failback iniciar basebackup."
@@ -547,8 +677,6 @@ check_master_postgres_healthy() {
             log_info "A online como REPLICA (check ${MASTER_HEALTH_COUNT}/${FAILBACK_HEALTH_REQUIRED})"
             ;;
         down)
-            # Se A foi parado por protecao split-brain, nao tentar subir
-            # O failback fara o basebackup com A parado (estado correto)
             if [ "$SPLITBRAIN_PROTECTED" = "1" ]; then
                 log_info "A parado por split-brain. Contando check para iniciar failback (${MASTER_HEALTH_COUNT}/${FAILBACK_HEALTH_REQUIRED})..."
                 MASTER_HEALTH_COUNT=$((MASTER_HEALTH_COUNT + 1))
@@ -559,7 +687,6 @@ check_master_postgres_healthy() {
             if try_start_postgres_remote_a; then
                 STATE_A=$(get_pg_state_remote_a)
                 log_ok "PostgreSQL em A subiu como ${STATE_A} apos inicializacao automatica."
-                # Se subiu como master, proteger imediatamente
                 if [ "$STATE_A" = "master" ]; then
                     protect_node_a_from_splitbrain || true
                     MASTER_HEALTH_COUNT=0
@@ -572,7 +699,6 @@ check_master_postgres_healthy() {
             fi
             ;;
     esac
-
     MASTER_HEALTH_COUNT=$((MASTER_HEALTH_COUNT + 1))
     [ "$MASTER_HEALTH_COUNT" -ge "$FAILBACK_HEALTH_REQUIRED" ]
 }
@@ -582,17 +708,14 @@ check_master_postgres_healthy() {
 ########################################
 is_failback_window() {
     [ "$FAILBACK_NOW" = "1" ] && return 0
-
     local NOW_H NOW_M NOW_MIN SCHED_H SCHED_M SCHED_MIN WINDOW_END
     NOW_H=$(date "+%H" | sed 's/^0//')
     NOW_M=$(date "+%M" | sed 's/^0//')
     NOW_MIN=$(( NOW_H * 60 + NOW_M ))
-
     SCHED_H=$(echo "$FAILBACK_SCHEDULE_TIME" | cut -d: -f1 | sed 's/^0//')
     SCHED_M=$(echo "$FAILBACK_SCHEDULE_TIME" | cut -d: -f2 | sed 's/^0//')
     SCHED_MIN=$(( SCHED_H * 60 + SCHED_M ))
     WINDOW_END=$(( SCHED_MIN + FAILBACK_SCHEDULE_WINDOW_MIN ))
-
     [ "$NOW_MIN" -ge "$SCHED_MIN" ] && [ "$NOW_MIN" -lt "$WINDOW_END" ]
 }
 
@@ -603,27 +726,28 @@ preflight_failback() {
     log "Executando pre-flight checks para failback..."
     local ERRORS=0
 
-    # 1. A responde via SSH
     if ! check_master_online; then
-        log_error "Pre-flight: A nao responde via SSH"
+        log_error "Pre-flight: A nao responde via SSH (LAN)"
         ERRORS=$((ERRORS + 1))
     fi
 
-    # 2. PostgreSQL em A
-    # Se SPLITBRAIN_PROTECTED=1, A foi parado intencionalmente — estado esperado
-    # O pg_basebackup vai reconstruir A do zero, nao precisa do PG rodando
-    local STATE_A
-    STATE_A=$(get_pg_state_remote_a)
+    local STATE_A; STATE_A=$(get_pg_state_remote_a)
     if [ "$SPLITBRAIN_PROTECTED" = "1" ]; then
         log_ok "Pre-flight: A parado por split-brain — estado esperado para basebackup."
     elif [ "$STATE_A" = "down" ]; then
-        log_error "Pre-flight: PostgreSQL em A nao responde"
-        ERRORS=$((ERRORS + 1))
+        local PGDATA_FILES
+        PGDATA_FILES=$(ssh_a "sudo find $PGDATA -mindepth 1 -maxdepth 1 2>/dev/null | wc -l" 2>/dev/null || echo "1")
+        PGDATA_FILES=$(echo "$PGDATA_FILES" | tr -d ' ')
+        if [ "${PGDATA_FILES:-1}" = "0" ]; then
+            log_ok "Pre-flight: PGDATA em A vazio — pronto para receber basebackup."
+        else
+            log_error "Pre-flight: PostgreSQL em A nao responde (PGDATA nao vazio ou inacessivel)"
+            ERRORS=$((ERRORS + 1))
+        fi
     else
         log_ok "Pre-flight: PostgreSQL em A OK (role=${STATE_A})"
     fi
 
-    # 3. Espaco livre em A
     local FREE_A
     FREE_A=$(ssh_a "df --output=avail -m /var/lib/pgsql | tail -1" 2>/dev/null | tr -d ' ' || echo 0)
     if [ "${FREE_A:-0}" -lt "$DISK_MIN_FREE_MB" ]; then
@@ -633,7 +757,6 @@ preflight_failback() {
         log_ok "Pre-flight: Espaco em A OK (${FREE_A}MB livres)"
     fi
 
-    # 4. Espaco livre em B
     local FREE_B
     FREE_B=$(df --output=avail -m /var/lib/pgsql | tail -1 | tr -d ' ')
     if [ "${FREE_B:-0}" -lt "$DISK_MIN_FREE_MB" ]; then
@@ -643,17 +766,13 @@ preflight_failback() {
         log_ok "Pre-flight: Espaco em B OK (${FREE_B}MB livres)"
     fi
 
-    # 5. B esta como master
     if ! check_if_promoted; then
         log_error "Pre-flight: B nao esta como master"
         ERRORS=$((ERRORS + 1))
     fi
 
-    # 6. Conectividade A -> B via TCP
-    # Se SPLITBRAIN_PROTECTED=1, A esta parado — nao tem como testar conectividade
-    # O pg_basebackup usa as credenciais do pgpass configurado no passo seguinte
     if [ "$SPLITBRAIN_PROTECTED" = "1" ]; then
-        log_ok "Pre-flight: Conectividade A->B pulada (A parado por split-brain — sera testada pelo pg_basebackup)."
+        log_ok "Pre-flight: Conectividade A->B pulada (A parado por split-brain)."
     elif ! ssh_a "sudo runuser -u postgres -- $PG_BIN/psql \
                 -h $SLAVE_B_IP -U $REPL_USER -d $HEALTH_DB \
                 -c 'SELECT 1' >/dev/null 2>&1"; then
@@ -663,9 +782,6 @@ preflight_failback() {
         log_ok "Pre-flight: Conectividade A->B OK"
     fi
 
-    # 7. Lag de replicacao de A
-    # Se SPLITBRAIN_PROTECTED=1, A esta parado — lag nao e verificavel nem relevante
-    # O basebackup vai copiar todos os dados de B para A do zero
     if [ "$SPLITBRAIN_PROTECTED" = "1" ]; then
         log_ok "Pre-flight: Verificacao de lag pulada (A parado — basebackup garantira zero data loss)."
     elif ! check_remote_lag_for_failback; then
@@ -684,7 +800,6 @@ preflight_failback() {
 🕐 Horário: $(timestamp)"
         return 1
     fi
-
     log_ok "Pre-flight OK — todos os checks passaram."
     return 0
 }
@@ -693,22 +808,20 @@ preflight_failback() {
 # GARANTE POSTGRESQL RODANDO (local B)
 ########################################
 ensure_postgres_running() {
-    systemctl is-active --quiet postgresql-16 && return 0
-
+    systemctl is-active --quiet $PG_SERVICE && return 0
     log_warn "PostgreSQL inativo. Tentando iniciar..."
-    systemctl start postgresql-16 >> "$LOGFILE" 2>&1
+    if [ -f "$PGDATA/standby.signal" ] && check_master_online; then
+        ensure_replica_config
+    fi
+    systemctl start $PG_SERVICE >> "$LOGFILE" 2>&1
     sleep 5
-
-    if systemctl is-active --quiet postgresql-16; then
+    if systemctl is-active --quiet $PG_SERVICE; then
         log_ok "PostgreSQL iniciou com sucesso."
         return 0
     fi
-
     log_error "PostgreSQL falhou ao iniciar."
     local _DISK_B _MEM_B _LOAD_B
-    _DISK_B=$(get_disk_info_local)
-    _MEM_B=$(get_mem_info_local)
-    _LOAD_B=$(get_load_local)
+    _DISK_B=$(get_disk_info_local); _MEM_B=$(get_mem_info_local); _LOAD_B=$(get_load_local)
     send_telegram "🚨 *POSTGRESQL NÃO SUBIU*
 
 🖥 *Host:* ${SLAVE_HOSTNAME} (${SLAVE_B_IP})
@@ -718,9 +831,31 @@ ensure_postgres_running() {
    🧠 Memória B: ${_MEM_B}
    ⚡ Load B: ${_LOAD_B}
 
-🔍 journalctl -u postgresql-16 -n 50
+🔍 journalctl -u $PG_SERVICE -n 50
 🕐 Horário: $(timestamp)"
     exit 1
+}
+
+########################################
+# GARANTIR B CONFIGURADO COMO REPLICA
+########################################
+ensure_replica_config() {
+    log_info "Verificando configuracao de replica em B..."
+    if [ ! -f "$PGDATA/standby.signal" ]; then
+        log_warn "standby.signal ausente — recriando..."
+        touch "$PGDATA/standby.signal"
+        chown postgres:postgres "$PGDATA/standby.signal"
+    fi
+    if ! grep -q "primary_conninfo" "$PGDATA/postgresql.auto.conf" 2>/dev/null; then
+        log_warn "primary_conninfo ausente — configurando..."
+        cat >> "$PGDATA/postgresql.auto.conf" << EOF
+primary_conninfo = 'host=${MASTER_A_IP} port=5432 user=${REPL_USER} password=${REPL_PASSWORD} application_name=nodeB'
+primary_slot_name = '${MY_SLOT}'
+recovery_target_timeline = 'latest'
+EOF
+        chown postgres:postgres "$PGDATA/postgresql.auto.conf"
+    fi
+    log_ok "Configuracao de replica OK."
 }
 
 ########################################
@@ -796,8 +931,7 @@ check_asterisk() {
 }
 
 pkill_if_recovery() {
-    local STATE
-    STATE=$(get_pg_state_local)
+    local STATE; STATE=$(get_pg_state_local)
     case "$STATE" in
         replica)
             log "No SLAVE — encerrando processos .rb"
@@ -818,15 +952,12 @@ pkill_if_recovery() {
 ########################################
 cleanup_old_db_backup() {
     [ ! -d "$BACKUP_DB_DIR" ] && return 0
-    local HOJE
-    HOJE=$(date +%Y-%m-%d)
+    local HOJE; HOJE=$(date +%Y-%m-%d)
     local PREFIXOS
     PREFIXOS=$(find "$BACKUP_DB_DIR" -maxdepth 1 -type f \
         \( -name 'db-*' -o -name 'db_*' \) \
         | sed -E 's#.*/(db.*)-[0-9]{4}-[0-9]{2}-[0-9]{2}$#\1#' | sort -u)
-
     [ -z "$PREFIXOS" ] && return 0
-
     for PREFIX in $PREFIXOS; do
         local ARQ_HOJE="${BACKUP_DB_DIR}/${PREFIX}-${HOJE}"
         [ ! -f "$ARQ_HOJE" ] && continue
@@ -845,9 +976,7 @@ cleanup_old_db_backup() {
 rollback_failback() {
     log_error "ROLLBACK: tentando restaurar B como master..."
     local _DISK_B _MEM_B _LOAD_B
-    _DISK_B=$(get_disk_info_local)
-    _MEM_B=$(get_mem_info_local)
-    _LOAD_B=$(get_load_local)
+    _DISK_B=$(get_disk_info_local); _MEM_B=$(get_mem_info_local); _LOAD_B=$(get_load_local)
     send_telegram "🚨 *FAILBACK FALHOU — ROLLBACK*
 
 ⚠️ Falha durante o processo de failback
@@ -862,13 +991,12 @@ rollback_failback() {
 🔍 Verifique: /var/log/failover.log
 🕐 Horário: $(timestamp)"
 
-    systemctl stop postgresql-16 2>/dev/null || true
+    systemctl stop $PG_SERVICE 2>/dev/null || true
     sleep 3
-    systemctl start postgresql-16 >> "$LOGFILE" 2>&1 || true
+    systemctl start $PG_SERVICE >> "$LOGFILE" 2>&1 || true
     sleep 5
 
-    local STATE
-    STATE=$(get_pg_state_local)
+    local STATE; STATE=$(get_pg_state_local)
     if [ "$STATE" = "replica" ]; then
         log_warn "Rollback: B subiu como slave. Promovendo de volta..."
         runuser -u postgres -- "$PG_BIN/pg_ctl" -D "$PGDATA" promote \
@@ -897,16 +1025,14 @@ do_failback() {
     FAILBACK_START_TS=$(date +%s)
 
     local _DISK_B _DISK_A _MEM_B _LOAD_B
-    _DISK_B=$(get_disk_info_local)
-    _DISK_A=$(get_disk_info_remote)
-    _MEM_B=$(get_mem_info_local)
-    _LOAD_B=$(get_load_local)
+    _DISK_B=$(get_disk_info_local); _DISK_A=$(get_disk_info_remote)
+    _MEM_B=$(get_mem_info_local);   _LOAD_B=$(get_load_local)
     send_telegram "🔄 *FAILBACK INICIANDO*
 
 🎯 *Objetivo:* Restaurar A como master
 
-🖥 *Node A:* ${MASTER_HOSTNAME} (${MASTER_A_IP}) — voltando
-🖥 *Node B:* ${SLAVE_HOSTNAME} (${SLAVE_B_IP}) — master atual
+🖥 *Node A:* ${MASTER_HOSTNAME} (${MASTER_A_IP} / ${MASTER_A_PUBLIC_IP}) — voltando
+🖥 *Node B:* ${SLAVE_HOSTNAME} (${SLAVE_B_IP} / ${SLAVE_B_PUBLIC_IP}) — master atual
 
 📊 *Métricas pré-failback:*
    💾 Disco A: ${_DISK_A}
@@ -922,21 +1048,18 @@ do_failback() {
     setup_pgpass_remote_a
     ensure_replication_slot_local "$REMOTE_SLOT"
 
-    # ── [1/6] Parar PostgreSQL em A ──────────────────────────────────────
     log "  [1/6] Parando PostgreSQL em A..."
-    if ! ssh_a_retry "sudo systemctl stop postgresql-16"; then
-        log_error "Nao foi possivel parar PostgreSQL em A"
+    if ! ssh_a_retry "sudo systemctl stop $PG_SERVICE || true"; then
+        log_error "Nao foi possivel executar stop em A"
         rollback_failback; return 1
     fi
     log_ok "  [1/6] PostgreSQL em A parado."
 
-    # ── [2/6] Limpar PGDATA em A ──────────────────────────────────────────
     log "  [2/6] Limpando PGDATA em A..."
     if [ -z "$PGDATA" ] || [ "$PGDATA" = "/" ]; then
         log_error "PGDATA invalido ('$PGDATA') — abortando"
         rollback_failback; return 1
     fi
-
     if ! ssh_a "sudo rm -rf $PGDATA && \
                 sudo mkdir -p $PGDATA && \
                 sudo chown postgres:postgres $PGDATA && \
@@ -946,10 +1069,8 @@ do_failback() {
     fi
     log_ok "  [2/6] PGDATA em A limpo."
 
-    # ── [3/6] pg_basebackup B → A ─────────────────────────────────────────
-    # tee fora do ssh_a — grava progresso no log do node B (local)
     log "  [3/6] pg_basebackup B -> A (timeout: ${BASEBACKUP_TIMEOUT}s)..."
-    if ! ssh_a "sudo runuser -u postgres -- timeout $BASEBACKUP_TIMEOUT \
+    if ! ssh_a "sudo runuser -u postgres -- /bin/timeout $BASEBACKUP_TIMEOUT \
                 $PG_BIN/pg_basebackup \
                 -h $SLAVE_B_IP -D $PGDATA -U $REPL_USER \
                 -P -v -R --wal-method=stream --slot=$REMOTE_SLOT" \
@@ -959,20 +1080,17 @@ do_failback() {
     fi
     log_ok "  [3/6] pg_basebackup B->A concluido."
 
-    # ── [4/6] Promover A como master ──────────────────────────────────────
     log "  [4/6] Iniciando PostgreSQL em A e promovendo..."
-    if ! ssh_a "sudo systemctl start postgresql-16"; then
+    if ! ssh_a "sudo systemctl start $PG_SERVICE"; then
         log_error "Nao foi possivel iniciar PostgreSQL em A"
         rollback_failback; return 1
     fi
     sleep 5
-
     if ! ssh_a "sudo runuser -u postgres -- $PG_BIN/pg_ctl -D $PGDATA promote"; then
         log_error "Promocao de A falhou"
         rollback_failback; return 1
     fi
 
-    # Aguardar A sair do recovery com retry
     local A_STATE=""
     local ATTEMPTS=0
     while [ $ATTEMPTS -lt 12 ]; do
@@ -982,34 +1100,24 @@ do_failback() {
         log_info "  [4/6] Aguardando A virar master (tentativa $ATTEMPTS/12, state=$A_STATE)..."
         sleep 5
     done
-
     if [ "$A_STATE" != "master" ]; then
         log_error "A nao assumiu como master apos promocao (state=$A_STATE)"
         rollback_failback; return 1
     fi
     log_ok "  [4/6] A promovido como master."
 
-    # Subir servicos em A (check_system) — igual ao que e feito no failover de B
-    log_info "  [4/6] Executando check_system em A para subir servicos..."
-    if ssh_a "check_system >> /var/log/failover.log 2>&1"; then
-        log_ok "  [4/6] check_system em A executado com sucesso."
-    else
-        log_warn "  [4/6] check_system em A retornou erro (nao critico — continuando)."
-    fi
-
+    log_info "  [4/6] Executando check_system em A..."
+    run_check_system_remote_a
     ensure_replication_slot_remote_a "$MY_SLOT"
     sleep 10
 
-    # ── [5/6] Reconstruir B como slave ────────────────────────────────────
     log "  [5/6] Reconstruindo B como slave..."
     check_asterisk
-    systemctl stop postgresql-16
-
+    systemctl stop $PG_SERVICE
     if [ -z "$PGDATA" ] || [ "$PGDATA" = "/" ]; then
         log_error "PGDATA invalido ('$PGDATA') — abortando rm -rf"
         rollback_failback; return 1
     fi
-
     rm -rf "$PGDATA"
     mkdir -p "$PGDATA"
     chown postgres:postgres "$PGDATA"
@@ -1025,13 +1133,11 @@ do_failback() {
     fi
     log_ok "  [5/6] pg_basebackup A->B concluido."
 
-    # ── [6/6] Subir B como slave ───────────────────────────────────────────
     log "  [6/6] Iniciando PostgreSQL em B como slave..."
-    systemctl start postgresql-16
+    systemctl start $PG_SERVICE
     sleep 5
 
-    local B_STATE
-    B_STATE=$(get_pg_state_local)
+    local B_STATE; B_STATE=$(get_pg_state_local)
     if [ "$B_STATE" != "replica" ]; then
         log_error "B nao iniciou como slave apos failback (state=$B_STATE)"
         rollback_failback; return 1
@@ -1041,19 +1147,18 @@ do_failback() {
     pkill_if_recovery
     MASTER_HEALTH_COUNT=0
     SPLITBRAIN_PROTECTED=0
+    DRG_ALERT_COUNT=0
     echo "$(timestamp)" > "$FLAG_FAILBACK"
     log_ok "FAILBACK concluido com sucesso"
 
-    local _DUR_FB _DISK_A _DISK_B _MEM_A _LOAD_A
+    local _DUR_FB _MEM_A _LOAD_A
     _DUR_FB=$(calc_duration "$FAILBACK_START_TS")
-    _DISK_A=$(get_disk_info_remote)
-    _DISK_B=$(get_disk_info_local)
-    _MEM_A=$(get_mem_info_remote)
-    _LOAD_A=$(get_load_remote)
+    _DISK_A=$(get_disk_info_remote); _DISK_B=$(get_disk_info_local)
+    _MEM_A=$(get_mem_info_remote);   _LOAD_A=$(get_load_remote)
     send_telegram "✅ *FAILBACK CONCLUÍDO*
 
-👑 *Master restaurado:* ${MASTER_HOSTNAME} (${MASTER_A_IP})
-🔄 *Replica:* ${SLAVE_HOSTNAME} (${SLAVE_B_IP})
+👑 *Master restaurado:* ${MASTER_HOSTNAME} (${MASTER_A_IP} / ${MASTER_A_PUBLIC_IP})
+🔄 *Replica:* ${SLAVE_HOSTNAME} (${SLAVE_B_IP} / ${SLAVE_B_PUBLIC_IP})
 
 ⏱ *Duração do failback:* ${_DUR_FB}
 📊 *Métricas pós-failback:*
@@ -1067,27 +1172,20 @@ do_failback() {
 
 ########################################
 # FAILOVER PRINCIPAL
-#
-# Melhoria 2: verifica lag antes de promover
-# Se a replica estiver muito atrasada, avisa mas pode prosseguir
-# dependendo de MAX_LAG_FOR_FAILOVER
 ########################################
 do_failover() {
     log "Promovendo B (${SLAVE_HOSTNAME}) para master..."
     ensure_postgres_running
 
-    # Verificar lag antes de promover
     if ! check_local_lag_acceptable; then
-        log_warn "B com lag alto — promovendo mesmo assim (A confirmado offline)"
-        log_warn "ATENCAO: pode haver perda de dados!"
-        local _LAG_B
-        _LAG_B=$(get_local_wal_lag_bytes 2>/dev/null || echo "N/A")
+        log_warn "B com lag alto — promovendo mesmo assim (A confirmado offline em LAN e rede pública)"
+        local _LAG_B; _LAG_B=$(get_local_wal_lag_bytes 2>/dev/null || echo "N/A")
         send_telegram "⚠️ *FAILOVER COM LAG ALTO*
 
 🖥 *Node B:* ${SLAVE_HOSTNAME}
 📡 *Lag WAL de B:* ${_LAG_B} bytes (limite: ${MAX_LAG_FOR_FAILOVER})
 
-⚠️ A está offline e não há alternativa — promovendo B mesmo assim
+⚠️ A está offline (LAN + rede pública) — promovendo B mesmo assim
 🔍 Verifique possível perda de dados após recuperação
 
 🕐 Horário: $(timestamp)"
@@ -1104,14 +1202,11 @@ do_failover() {
         sleep 2
     done
 
-    local FINAL_STATE
-    FINAL_STATE=$(get_pg_state_local)
+    local FINAL_STATE; FINAL_STATE=$(get_pg_state_local)
     if [ "$FINAL_STATE" != "master" ]; then
         log_error "B nao assumiu como master apos promocao (state=$FINAL_STATE)"
         local _DISK_B _MEM_B _LOAD_B
-        _DISK_B=$(get_disk_info_local)
-        _MEM_B=$(get_mem_info_local)
-        _LOAD_B=$(get_load_local)
+        _DISK_B=$(get_disk_info_local); _MEM_B=$(get_mem_info_local); _LOAD_B=$(get_load_local)
         send_telegram "🚨 *FALHA NO FAILOVER*
 
 ❌ B não conseguiu se promover a master
@@ -1129,20 +1224,16 @@ do_failover() {
     fi
 
     log_ok "Failover OK. Subindo servicos em B..."
-    /usr/local/rbenv/shims/ruby \
-        /home/totalip/ipserver/nagios/check_system.rb -v \
-        >> "$LOGFILE" 2>&1 || log_warn "check_system.rb retornou erro"
+    run_check_system_local
 
     local _DUR_FO _DISK_B _MEM_B _LOAD_B _LAG
     _DUR_FO=$(calc_duration "$FAILOVER_START_TS")
-    _DISK_B=$(get_disk_info_local)
-    _MEM_B=$(get_mem_info_local)
-    _LOAD_B=$(get_load_local)
+    _DISK_B=$(get_disk_info_local); _MEM_B=$(get_mem_info_local); _LOAD_B=$(get_load_local)
     _LAG=$(get_local_wal_lag_bytes 2>/dev/null || echo "N/A")
     send_telegram "✅ *FAILOVER CONCLUÍDO*
 
-🖥 *Novo Master:* ${SLAVE_HOSTNAME} (${SLAVE_B_IP})
-🔌 *Master anterior:* ${MASTER_HOSTNAME} (${MASTER_A_IP}) — OFFLINE
+🖥 *Novo Master:* ${SLAVE_HOSTNAME} (${SLAVE_B_IP} / ${SLAVE_B_PUBLIC_IP})
+🔌 *Master anterior:* ${MASTER_HOSTNAME} (${MASTER_A_IP} / ${MASTER_A_PUBLIC_IP}) — OFFLINE
 
 ⏱ *Duração do failover:* ${_DUR_FO}
 📊 *Métricas pós-failover:*
@@ -1158,9 +1249,9 @@ do_failover() {
 # MAIN LOOP
 ########################################
 log "pg-failover iniciado (PID $$) — systemd managed"
-log "  No local  : ${SLAVE_HOSTNAME} (${SLAVE_B_IP})"
-log "  No remoto : ${MASTER_A_IP}"
-log "  Failover threshold : ${FAILOVER_THRESHOLD} falhas consecutivas (ping+ssh+pg)"
+log "  No local  : ${SLAVE_HOSTNAME} (${SLAVE_B_IP} / pub: ${SLAVE_B_PUBLIC_IP})"
+log "  No remoto : ${MASTER_A_IP} (pub: ${MASTER_A_PUBLIC_IP})"
+log "  Failover threshold : ${FAILOVER_THRESHOLD} falhas consecutivas (LAN + rede publica)"
 log "  Failback agendado  : ${FAILBACK_SCHEDULE_TIME} (+${FAILBACK_SCHEDULE_WINDOW_MIN}min)"
 log "  Failback imediato  : FAILBACK_NOW=${FAILBACK_NOW}"
 log "  Max lag failover   : ${MAX_LAG_FOR_FAILOVER} bytes"
@@ -1176,27 +1267,23 @@ pkill_if_recovery
 while true; do
 
     ensure_postgres_running
-    MASTER_HOSTNAME=$(get_master_hostname)
 
     # ------------------------------------------------------------------ #
     # MASTER A ONLINE
     # ------------------------------------------------------------------ #
     if check_master_online; then
+        MASTER_HOSTNAME=$(get_master_hostname)   # SSH só quando A responde
         FAILURE_COUNT=0
+        DRG_ALERT_COUNT=0
         LOCAL_STATE=$(get_pg_state_local)
 
-        # Limpar flags quando A voltou — DEVE VIR ANTES de qualquer checagem
-        # O continue abaixo pularia este bloco se ficasse depois
         if [ -s "$FLAG_FAILOVER" ]; then
             log_info "A (${MASTER_HOSTNAME}) voltou online. Reiniciando ciclo de failback."
-            local _DISK_A _MEM_A _LOAD_A _STATE_A
-            _DISK_A=$(get_disk_info_remote)
-            _MEM_A=$(get_mem_info_remote)
-            _LOAD_A=$(get_load_remote)
+            _DISK_A=$(get_disk_info_remote); _MEM_A=$(get_mem_info_remote); _LOAD_A=$(get_load_remote)
             _STATE_A=$(get_pg_state_remote_a)
             send_telegram "🟢 *MASTER A VOLTOU ONLINE*
 
-🖥 *Node A:* ${MASTER_HOSTNAME} (${MASTER_A_IP})
+🖥 *Node A:* ${MASTER_HOSTNAME} (${MASTER_A_IP} / ${MASTER_A_PUBLIC_IP})
    PostgreSQL: ${_STATE_A}
 📊 *Métricas:*
    💾 Disco A: ${_DISK_A}
@@ -1210,22 +1297,18 @@ while true; do
             MASTER_HEALTH_COUNT=0
         fi
 
-        # B e master — avaliar failback
         if [ "$LOCAL_STATE" = "master" ]; then
-
             if [ -s "$FAILBACK_ERROR_FLAG" ]; then
                 log_warn "Failback anterior com erro — intervencao manual necessaria"
                 log_warn "Para desbloquear: truncate -s0 $FAILBACK_ERROR_FLAG"
                 sleep "$CHECK_INTERVAL"
                 continue
             fi
-
             if [ -s "$FLAG_FAILBACK" ]; then
                 log_info "Failback ja concluido neste ciclo."
                 sleep "$CHECK_INTERVAL"
                 continue
             fi
-
             if check_master_postgres_healthy; then
                 if is_failback_window; then
                     log "Janela de failback ativa (${FAILBACK_SCHEDULE_TIME}) — iniciando failback..."
@@ -1236,41 +1319,49 @@ while true; do
             fi
         fi
 
-        # B e replica — estado normal
         if [ "$LOCAL_STATE" = "replica" ]; then
-            log_info "B=replica, A=online — estado normal."
+            HEARTBEAT_COUNT=$(( ${HEARTBEAT_COUNT:-0} + 1 ))
+            if [ "$HEARTBEAT_COUNT" -ge 12 ]; then
+                HEARTBEAT_COUNT=0
+                _LAG=$(get_local_wal_lag_bytes 2>/dev/null || echo "N/A")
+                log_info "STATUS OK | A=master (${MASTER_HOSTNAME}) | B=replica | lag=${_LAG} bytes"
+            fi
+            {
+                _NOW_H=$(date "+%H" | sed 's/^0*//' | grep -v '^$' || echo "0")
+                _NOW_M=$(date "+%M" | sed 's/^0*//' | grep -v '^$' || echo "0")
+                _TODAY=$(date "+%Y-%m-%d")
+                if [ "$_NOW_H" -eq 22 ] && [ "$_NOW_M" -lt 2 ] && \
+                   [ "${LAST_DAILY_REPORT:-}" != "$_TODAY" ]; then
+                    LAST_DAILY_REPORT="$_TODAY"
+                    send_status_report "Relatório Diário 22h" || true
+                fi
+            } 2>/dev/null || true
         fi
 
     # ------------------------------------------------------------------ #
-    # MASTER A OFFLINE — aguarda confirmação tripla antes de failover
+    # MASTER A OFFLINE — verifica LAN + pública antes de failover
     # ------------------------------------------------------------------ #
     else
         MASTER_HEALTH_COUNT=0
 
         if master_confirmed_offline; then
 
-            # FIX: A caiu de novo apos failback ja concluido
-            # Limpar FLAG_FAILBACK para permitir novo ciclo quando A voltar
             if [ -s "$FLAG_FAILBACK" ]; then
                 log_info "A caiu novamente apos failback anterior. Reiniciando ciclo."
                 > "$FLAG_FAILBACK"
             fi
 
-            # FIX: resetar contador apos atingir threshold (evita log poluido)
             if [ "$FAILURE_COUNT" -gt "$FAILOVER_THRESHOLD" ]; then
                 FAILURE_COUNT=$FAILOVER_THRESHOLD
             fi
 
             if [ ! -s "$FLAG_FAILOVER" ]; then
                 FAILOVER_START_TS=$(date +%s)
-                local _DISK_B _MEM_B _LOAD_B
-                _DISK_B=$(get_disk_info_local)
-                _MEM_B=$(get_mem_info_local)
-                _LOAD_B=$(get_load_local)
+                _DISK_B=$(get_disk_info_local); _MEM_B=$(get_mem_info_local); _LOAD_B=$(get_load_local)
                 send_telegram "🔴 *FAILOVER INICIADO*
 
-🖥 *Master A:* ${MASTER_HOSTNAME} (${MASTER_A_IP})
-   Status: OFFLINE confirmado (${FAILOVER_THRESHOLD}/${FAILOVER_THRESHOLD} checks)
+🖥 *Master A:* ${MASTER_HOSTNAME} (${MASTER_A_IP} / ${MASTER_A_PUBLIC_IP})
+   Status: OFFLINE confirmado (LAN + rede pública — ${FAILOVER_THRESHOLD}/${FAILOVER_THRESHOLD} checks)
 
 🔄 *Promovendo B:* ${SLAVE_HOSTNAME} (${SLAVE_B_IP})
 
@@ -1291,7 +1382,6 @@ while true; do
         fi
     fi
 
-    # Detectar mudanca de estado local
     CURRENT_STATE=$(get_pg_state_local)
     if [ "$CURRENT_STATE" != "$LAST_STATE" ]; then
         log "Mudanca de estado em B: ${LAST_STATE} -> ${CURRENT_STATE}"

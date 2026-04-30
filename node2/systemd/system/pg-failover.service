@@ -1,0 +1,43 @@
+[Unit]
+Description=PostgreSQL HA — Failover e Failback Automatico
+Documentation=file:///usr/local/bin/pg-failover.sh
+After=network-online.target postgresql-16.service
+Wants=network-online.target
+
+[Service]
+User=root
+Group=root
+Type=simple
+
+ExecStartPre=/usr/bin/test -x /usr/local/bin/pg-failover.sh
+ExecStart=/usr/local/bin/pg-failover.sh
+
+# Reinicia em falha (exit != 0); saida 0 = intencional, nao reinicia
+Restart=on-failure
+RestartSec=15s
+
+# Limite de reinicializacoes: max 5 em 2 minutos
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+# Permite forcar failback imediato via:
+#   systemctl set-environment FAILBACK_NOW=1
+Environment=FAILBACK_NOW=0
+Environment=PGPASSFILE=/var/lib/pgsql/.pgpass
+
+# Protecao contra OOM durante operacoes de replicacao
+OOMScoreAdjust=-500
+LimitNOFILE=65536
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=pg-failover
+
+TimeoutStartSec=30
+# Nao matar durante um pg_basebackup em andamento
+TimeoutStopSec=120
+KillMode=control-group
+KillSignal=SIGTERM
+
+[Install]
+WantedBy=multi-user.target
