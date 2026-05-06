@@ -1,0 +1,5 @@
+# Rsync Gravacoes HA Check
+0 3 * * * flock -n /tmp/verify_monitor.lock bash -lc 'ruby /home/totalip/verify_monitor.rb' >> /var/log/verify_monitor.log 2>&1
+
+# Rsync Gravacoes HA Make Files
+* * * * * flock -n /tmp/sync_monitor.lock bash -lc 'ruby /home/totalip/sync_monitor.rb' >> /var/log/sync_monitor.log 2>&1
