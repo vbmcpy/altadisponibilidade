@@ -154,6 +154,19 @@ RSYNC_LAST_SLOT=""
 # HA NUNCA espera rsync — rsync é sempre sacrificado em favor do HA
 RSYNC_PID=""
 
+#--------------------------------------
+# RSYNC PRIVILEGE CHECK
+# Verifica se rsync@A tem sudo NOPASSWD para rsync
+# Resultado incluso no relatório diário das 22h
+# Se falhar: alerta Telegram a cada hora
+# NUNCA bloqueia HA — é apenas informativo
+#--------------------------------------
+RSYNC_PRIV_STATUS="unknown"   # "ok" | "fail" | "unknown"
+RSYNC_PRIV_LAST_CHECK=0       # epoch do último check
+RSYNC_PRIV_LAST_ALERT=0       # epoch do último alerta enviado
+RSYNC_PRIV_CHECK_INTERVAL=3600   # intervalo entre checks (1h)
+RSYNC_PRIV_ALERT_INTERVAL=3600   # intervalo entre alertas (1h)
+
 ########################################
 # INICIALIZAÇÃO
 ########################################
@@ -297,6 +310,7 @@ send_status_report() {
    ⚡ Load: ${LOAD_B} | CPU: ${CPU_B}
 
 📡 *Lag WAL:* ${LAG} bytes
+🔑 *Rsync privs em A:* $(case "${RSYNC_PRIV_STATUS:-unknown}" in ok) echo "✅ OK" ;; fail) echo "❌ SEM PRIVILÉGIO — execute hasetup.sh em ${MASTER_A_IP}" ;; *) echo "❓ Não verificado ainda" ;; esac)
 🕐 ${CONTEXT} | $(timestamp)"
 }
 
@@ -1348,6 +1362,101 @@ run_scheduled_rsync() {
 }
 
 ########################################
+# RSYNC PRIVILEGE CHECK — NODE A
+#
+# Verifica se o usuário rsync em A tem sudo NOPASSWD para o binário rsync.
+# Necessário para que pg-failover sincronize /home/totalip, /etc/asterisk
+# e /var/lib/asterisk/sounds via --rsync-path="sudo -n rsync".
+#
+# Comportamento:
+#   - Roda SINCRONAMENTE mas apenas uma vez por hora (custo ~3s no máximo)
+#   - NUNCA propaga erro — não interfere com HA, failover ou failback
+#   - Se OK       → status guardado para o relatório diário das 22h
+#   - Se FAIL     → alerta Telegram a cada hora com comando de correção
+#   - Se A OFFLINE → status "unknown", alerta adiado para quando A voltar
+########################################
+_check_rsync_priv_a() {
+    # SSH dedicado com -T (sem TTY → sem profile.d) e timeout apertado de 3s
+    # Todo output descartado — apenas o exit code importa
+    # sudo -n = non-interactive, falha IMEDIATAMENTE se precisar de senha
+    # SSH pode retornar: 0=ok, 1=cmd falhou, 255=falha de conexão
+    local _RC=0
+    ssh -T \
+        -i "${SSH_KEY}" \
+        -o IdentitiesOnly=yes \
+        -o BatchMode=yes \
+        -o StrictHostKeyChecking=no \
+        -o ConnectTimeout=3 \
+        -o ServerAliveInterval=3 \
+        -o ServerAliveCountMax=1 \
+        "${SSH_USER}@${MASTER_A_IP}" \
+        "sudo -n rsync --version" >/dev/null 2>&1 || _RC=$?
+    return $_RC
+}
+
+run_rsync_priv_check() {
+    # ── Captura timestamp com fallback numérico ───────────────────────────────
+    # Protege contra falha de 'date' com set -uo pipefail
+    local NOW=0
+    NOW=$(date +%s 2>/dev/null || echo 0)
+    # Garante aritmética segura — converte para inteiro, 0 se inválido
+    NOW=$(( NOW + 0 )) 2>/dev/null || NOW=0
+
+    local _LAST_CHECK=0 _LAST_ALERT=0 _CHECK_IV=3600 _ALERT_IV=3600
+    _LAST_CHECK=$(( ${RSYNC_PRIV_LAST_CHECK:-0} + 0 )) 2>/dev/null || _LAST_CHECK=0
+    _LAST_ALERT=$(( ${RSYNC_PRIV_LAST_ALERT:-0} + 0 )) 2>/dev/null || _LAST_ALERT=0
+    _CHECK_IV=$(( ${RSYNC_PRIV_CHECK_INTERVAL:-3600} + 0 )) 2>/dev/null || _CHECK_IV=3600
+    _ALERT_IV=$(( ${RSYNC_PRIV_ALERT_INTERVAL:-3600} + 0 )) 2>/dev/null || _ALERT_IV=3600
+
+    # Executa no máximo uma vez por hora — custo zero fora do intervalo
+    [ $(( NOW - _LAST_CHECK )) -lt "$_CHECK_IV" ] && return 0
+    RSYNC_PRIV_LAST_CHECK=$NOW
+
+    # A offline → não conseguimos checar, mantém status anterior silenciosamente
+    if ! check_master_online 2>/dev/null; then
+        RSYNC_PRIV_STATUS="unknown"
+        log_info "PRIV-CHECK rsync@A: A (${MASTER_A_IP}) offline — verificacao adiada"
+        return 0
+    fi
+
+    # Testa o privilégio — RC pode ser 0 (ok), 1 (sem priv), 255 (ssh fail), etc.
+    local RC=0
+    _check_rsync_priv_a || RC=$?
+
+    case "$RC" in
+        0)
+            RSYNC_PRIV_STATUS="ok"
+            log_ok "PRIV-CHECK rsync@A (${MASTER_A_IP}): sudo NOPASSWD para rsync — OK"
+            ;;
+        *)
+            # Qualquer exit != 0: sem privilégio ou SSH falhou
+            RSYNC_PRIV_STATUS="fail"
+            log_warn "PRIV-CHECK rsync@A (${MASTER_A_IP}): SEM sudo NOPASSWD para rsync (rc=${RC}) — sync de arquivos inativo"
+            # Alerta a cada hora enquanto o problema persistir
+            if [ $(( NOW - _LAST_ALERT )) -ge "$_ALERT_IV" ]; then
+                RSYNC_PRIV_LAST_ALERT=$NOW
+                send_telegram "⚠️ *ALERTA — PRIVILÉGIOS RSYNC EM A*
+
+❌ O usuário *rsync* em ${MASTER_HOSTNAME} \`(${MASTER_A_IP})\` não tem
+   \`sudo NOPASSWD\` para o binário rsync
+
+📁 *Sincronização de arquivos INATIVA:*
+   • /home/totalip
+   • /etc/asterisk
+   • /var/lib/asterisk/sounds
+
+🔧 *Ação manual necessária em ${MASTER_A_IP}:*
+   \`sudo sh /home/totalip/hasetup.sh\`
+
+⏰ Este alerta se repete a cada hora enquanto não corrigido
+🕐 $(timestamp)" || true
+            fi
+            ;;
+    esac
+    return 0   # NUNCA propaga erro — check é apenas informativo
+}
+
+########################################
 # FAILBACK PRINCIPAL
 ########################################
 do_failback() {
@@ -1693,6 +1802,7 @@ while true; do
             > "$FLAG_FAILOVER"
             > "$FLAG_FAILBACK"
             MASTER_HEALTH_COUNT=0
+            RSYNC_PRIV_LAST_CHECK=0   # Força re-check de privilégios quando A voltar
         fi
 
         if [ "$LOCAL_STATE" = "master" ]; then
@@ -1790,6 +1900,10 @@ while true; do
     # ── Verifica janela de sync agendado (06/13/17/22h) ─────────────────────
     # Custo zero se fora da janela — apenas uma comparação de string
     run_scheduled_rsync || true
+
+    # ── Verifica privilégios rsync em A (a cada 1h) ──────────────────────────
+    # Alerta Telegram se não OK — nunca bloqueia HA
+    run_rsync_priv_check || true
 
     sleep "$CHECK_INTERVAL"
 done
