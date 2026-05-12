@@ -1,5 +1,5 @@
 #!/bin/bash
-# pg-failover.sh — Failover + Failback automático PostgreSQL HA (hardened v2)
+# pg-failover.sh — Failover + Failback automático PostgreSQL HA (hardened v4)
 # Gerenciado por: pg-failover.service (systemd)
 #
 # REGRAS DE CONEXÃO:
@@ -24,6 +24,16 @@
 #   [7] Removidos "local" inválidos do main loop (bug silencioso com set -uo)
 #   [8] get_master_hostname movido para branch "A ONLINE" (evita timeout desnecessário)
 #   [9] check_a_via_public com short-circuit (reduz até 33s extras no RTO em worst case)
+#
+# MELHORIAS v4 (rsync):
+#   [10] Sincronização bidirecional A↔B de /home/totalip, /etc/asterisk, /var/lib/asterisk/sounds
+#        - A→B em operação normal (A é master)
+#        - B→A durante failover/failback (B é master)
+#        - Agendado: 06:00 13:00 17:00 22:00
+#        - Executado imediatamente ao reiniciar o script
+#        - Integrado no do_failback (B→A antes + A→B depois)
+#        - RSYNC_DRY_RUN=1 para simulação sem alterar nada
+#        - NUNCA propaga erros — HA não pode falhar por rsync
 
 
 usermod -aG totalip postgres
@@ -108,17 +118,51 @@ MAX_LAG_FOR_FAILBACK=1048576   # 1MB
 #--------------------------------------
 # FAILBACK AGENDADO
 #--------------------------------------
-FAILBACK_SCHEDULE_TIME="04:00"
+FAILBACK_SCHEDULE_TIME="02:00"
 FAILBACK_SCHEDULE_WINDOW_MIN=30
 FAILBACK_NOW="${FAILBACK_NOW:-0}"
+
+########################################
+# RSYNC CONFIG (v4)
+# Para dry-run (simulação sem alterar nada): RSYNC_DRY_RUN=1 ./pg-failover.sh
+# Ou defina no /etc/pg-failover.env: RSYNC_DRY_RUN=1
+########################################
+RSYNC_DRY_RUN="${RSYNC_DRY_RUN:-0}"
+
+# Diretórios sincronizados bidireccionalmente A↔B
+RSYNC_DIRS=(
+    "/home/totalip"
+    "/etc/asterisk"
+    "/var/lib/asterisk/sounds"
+)
+
+# Horários agendados (HH no formato 24h, zero-padded)
+RSYNC_SCHEDULE_HOURS=("06" "13" "17" "22")
+
+# Janela em minutos após o horário agendado em que o sync pode ser disparado
+RSYNC_WINDOW_MIN=4
+
+# Logs e flags do rsync
+RSYNC_LOG="${LOGDIR}/rsync-sync.log"
+RSYNC_FLAG="${FLAGDIR}/.rsync_last_run"
+
+# Controle interno — impede dupla execução no mesmo slot (ex: 06_2025-05-12)
+RSYNC_LAST_SLOT=""
+
+# PID do processo rsync rodando em background
+# Rastreado para ser abortado imediatamente quando HA precisar agir
+# HA NUNCA espera rsync — rsync é sempre sacrificado em favor do HA
+RSYNC_PID=""
 
 ########################################
 # INICIALIZAÇÃO
 ########################################
 mkdir -p "$LOGDIR" "$FLAGDIR"
-touch "$LOGFILE" "$FLAG_FAILOVER" "$FLAG_FAILBACK" "$FAILBACK_ERROR_FLAG"
+touch "$LOGFILE" "$FLAG_FAILOVER" "$FLAG_FAILBACK" "$FAILBACK_ERROR_FLAG" "$RSYNC_FLAG"
 chmod 640 "$LOGFILE"
-chmod 600 "$FLAG_FAILOVER" "$FLAG_FAILBACK" "$FAILBACK_ERROR_FLAG"
+chmod 600 "$FLAG_FAILOVER" "$FLAG_FAILBACK" "$FAILBACK_ERROR_FLAG" "$RSYNC_FLAG"
+touch "$RSYNC_LOG"
+chmod 640 "$RSYNC_LOG"
 
 FAILURE_COUNT=0
 MASTER_HEALTH_COUNT=0
@@ -1018,9 +1062,297 @@ rollback_failback() {
 }
 
 ########################################
+# RSYNC — SINCRONIZAÇÃO BIDIRECIONAL A↔B  (v4)
+#
+# Princípio de não-falha:
+#   Todos os erros de rsync são capturados internamente.
+#   As funções SEMPRE retornam 0 — nunca propagam falha para o loop HA.
+#
+# Dry-run:
+#   Defina RSYNC_DRY_RUN=1 no ambiente ou em /etc/pg-failover.env.
+#   Com dry-run ativo, rsync apenas lista o que seria transferido/deletado,
+#   sem aplicar nenhuma alteração. Um alerta Telegram é enviado com o resultado.
+#
+# Permissões:
+#   O usuário SSH (rsync) acessa A com --rsync-path="sudo rsync" para
+#   garantir leitura/escrita em /etc/asterisk e /home/totalip em A.
+#   Localmente o script já roda como root, sem restrições.
+########################################
+
+# Argumentos extras para modo dry-run
+_rsync_extra_args() {
+    if [ "$RSYNC_DRY_RUN" = "1" ]; then
+        echo "--dry-run --itemize-changes"
+    else
+        echo ""
+    fi
+}
+
+# Núcleo do rsync — NUNCA retorna código de erro
+# Uso: _rsync_core "a_to_b" | "b_to_a"
+_rsync_core() {
+    local DIRECTION="$1"
+    local EXTRA_ARGS; EXTRA_ARGS=$(_rsync_extra_args)
+    local ERRORS=0
+    local LABEL_DIR="🔄"
+    local LABEL_MODE=""
+
+    if [ "$RSYNC_DRY_RUN" = "1" ]; then
+        LABEL_DIR="🔍"
+        LABEL_MODE=" (DRY-RUN — nenhuma alteracao aplicada)"
+        log_info "RSYNC ${DIRECTION} — MODO DRY-RUN ATIVO${LABEL_MODE}"
+    else
+        log_info "RSYNC ${DIRECTION} — iniciando sincronizacao"
+    fi
+
+    # Cabeçalho no log dedicado
+    echo "" >> "$RSYNC_LOG" 2>/dev/null || true
+    echo "$(timestamp) ======== RSYNC ${DIRECTION}${LABEL_MODE} ========" >> "$RSYNC_LOG" 2>/dev/null || true
+
+    local DIR
+    for DIR in "${RSYNC_DIRS[@]}"; do
+        log_info "RSYNC ${DIRECTION}: ${DIR}"
+        local CMD_RC=0
+
+        # Garante que o diretório destino existe localmente (a_to_b)
+        if [ "$DIRECTION" = "a_to_b" ]; then
+            mkdir -p "${DIR}" 2>/dev/null || true
+        fi
+
+        # SSH para rsync:
+        #   -T  → sem alocação de TTY — impede que /etc/profile.d/ seja carregado
+        #         pelo shell remoto e elimina o erro "sudo: a terminal is required"
+        #   sudo -n → falha imediatamente se senha for pedida (em vez de travar)
+        #            requer entrada no sudoers de A:
+        #            rsync ALL=(ALL) NOPASSWD: /usr/bin/rsync
+        local RSYNC_SSH_CMD="ssh -T -i ${SSH_KEY} \
+            -o IdentitiesOnly=yes \
+            -o BatchMode=yes \
+            -o StrictHostKeyChecking=no \
+            -o ConnectTimeout=15 \
+            -o ServerAliveInterval=10 \
+            -o ServerAliveCountMax=3"
+
+        if [ "$DIRECTION" = "a_to_b" ]; then
+            # ── Puxa de A para B (executa em B, origem = A) ──────────────────
+            # shellcheck disable=SC2086
+            rsync -az --delete --no-motd ${EXTRA_ARGS} \
+                --rsync-path="sudo -n rsync" \
+                -e "$RSYNC_SSH_CMD" \
+                "${SSH_USER}@${MASTER_A_IP}:${DIR}/" \
+                "${DIR}/" \
+                >> "$RSYNC_LOG" 2>&1 || CMD_RC=$?
+        else
+            # ── Empurra de B para A (executa em B, destino = A) ──────────────
+            # Garante que o diretório existe em A antes de enviar
+            ssh_a "sudo -n mkdir -p '${DIR}' 2>/dev/null; true" 2>/dev/null || true
+            # shellcheck disable=SC2086
+            rsync -az --delete --no-motd ${EXTRA_ARGS} \
+                --rsync-path="sudo -n rsync" \
+                -e "$RSYNC_SSH_CMD" \
+                "${DIR}/" \
+                "${SSH_USER}@${MASTER_A_IP}:${DIR}/" \
+                >> "$RSYNC_LOG" 2>&1 || CMD_RC=$?
+        fi
+
+        if [ "$CMD_RC" -eq 0 ]; then
+            log_ok "RSYNC ${DIRECTION}: ${DIR} OK${LABEL_MODE}"
+        else
+            log_warn "RSYNC ${DIRECTION}: FALHA em ${DIR} (rc=${CMD_RC}) — verifique ${RSYNC_LOG}"
+            ERRORS=$((ERRORS + 1))
+        fi
+    done
+
+    # ── Notificação e flag de controle ───────────────────────────────────────
+    local DIRS_LIST=""
+    for D in "${RSYNC_DIRS[@]}"; do
+        DIRS_LIST="${DIRS_LIST}   • ${D}
+"
+    done
+
+    local ORIGEM_DESTINO
+    if [ "$DIRECTION" = "a_to_b" ]; then
+        ORIGEM_DESTINO="${MASTER_HOSTNAME} (${MASTER_A_IP}) → ${SLAVE_HOSTNAME} (${SLAVE_B_IP})"
+    else
+        ORIGEM_DESTINO="${SLAVE_HOSTNAME} (${SLAVE_B_IP}) → ${MASTER_HOSTNAME} (${MASTER_A_IP})"
+    fi
+
+    if [ "$ERRORS" -eq 0 ]; then
+        echo "$(timestamp) ${DIRECTION}${LABEL_MODE}" > "$RSYNC_FLAG" 2>/dev/null || true
+        log_ok "RSYNC ${DIRECTION} concluido (${#RSYNC_DIRS[@]} dirs, ${ERRORS} erros)${LABEL_MODE}"
+        send_telegram "${LABEL_DIR} *RSYNC ${DIRECTION} CONCLUÍDO${LABEL_MODE}*
+
+📁 *Diretórios sincronizados (${#RSYNC_DIRS[@]}):*
+${DIRS_LIST}
+🔀 *Fluxo:* ${ORIGEM_DESTINO}
+
+🕐 $(timestamp)" 2>/dev/null || true
+    else
+        log_warn "RSYNC ${DIRECTION} concluido com ${ERRORS}/${#RSYNC_DIRS[@]} erros"
+        send_telegram "⚠️ *RSYNC ${DIRECTION} — ${ERRORS} ERRO(S)*
+
+❌ ${ERRORS} de ${#RSYNC_DIRS[@]} diretórios falharam
+🔀 Fluxo: ${ORIGEM_DESTINO}
+📋 Verifique: ${RSYNC_LOG}
+
+🕐 $(timestamp)" 2>/dev/null || true
+    fi
+
+    # Nunca propaga erro — HA não pode falhar por rsync
+    return 0
+}
+
+# Sincroniza A → B  (A é master, B recebe arquivos atualizados)
+# Verifica conectividade antes de tentar
+do_rsync_a_to_b() {
+    if ! check_master_online 2>/dev/null; then
+        log_warn "RSYNC A→B: A (${MASTER_A_IP}) offline — sincronizacao adiada"
+        return 0
+    fi
+    _rsync_core "a_to_b" || true
+    return 0
+}
+
+# Sincroniza B → A  (B é master durante failover, empurra para A)
+# Verifica conectividade antes de tentar
+do_rsync_b_to_a() {
+    if ! check_master_online 2>/dev/null; then
+        log_warn "RSYNC B→A: A (${MASTER_A_IP}) offline — sincronizacao adiada"
+        return 0
+    fi
+    _rsync_core "b_to_a" || true
+    return 0
+}
+
+# Retorna 0 se o horário atual está dentro de uma janela de sync agendada
+# e esse slot ainda não foi executado neste processo
+_is_rsync_schedule_now() {
+    local NOW_H NOW_M NOW_M_INT
+    NOW_H=$(date "+%H")
+    NOW_M=$(date "+%M")
+    # Remove zeros à esquerda para comparação aritmética
+    NOW_M_INT=$(echo "$NOW_M" | sed 's/^0*//' | grep -v '^$' || echo "0")
+
+    local H
+    for H in "${RSYNC_SCHEDULE_HOURS[@]}"; do
+        if [ "$NOW_H" = "$H" ] && [ "$NOW_M_INT" -lt "$RSYNC_WINDOW_MIN" ]; then
+            local SLOT_KEY="${H}_$(date '+%Y-%m-%d')"
+            if [ "${RSYNC_LAST_SLOT:-}" != "$SLOT_KEY" ]; then
+                return 0   # Está na janela e slot não foi executado
+            fi
+        fi
+    done
+    return 1   # Fora da janela ou slot já executado
+}
+
+_mark_rsync_slot_done() {
+    RSYNC_LAST_SLOT="$(date '+%H')_$(date '+%Y-%m-%d')"
+}
+
+# ── _rsync_pid_running ───────────────────────────────────────────────────────
+# Retorna 0 (verdadeiro) SOMENTE se RSYNC_PID está rodando de verdade.
+# kill -0 não serve: no Linux retorna 0 inclusive para processos ZOMBIE,
+# o que causaria run_scheduled_rsync a nunca disparar novo sync após um
+# rsync que terminou naturalmente.
+# Solução: lê /proc/$PID/stat — campo 3 = "Z" significa zombie.
+_rsync_pid_running() {
+    local PID="${RSYNC_PID:-}"
+    [ -z "$PID" ] && return 1                              # PID não definido
+    local ST
+    ST=$(awk '{print $3}' "/proc/${PID}/stat" 2>/dev/null) || return 1  # Processo não existe
+    [ "$ST" != "Z" ]                                       # Zombie = não está rodando
+}
+
+# ── _rsync_reap ──────────────────────────────────────────────────────────────
+# Recolhe (reap) o processo rsync se terminou — limpa a entrada zombie
+# da tabela de processos e zera RSYNC_PID.
+_rsync_reap() {
+    local PID="${RSYNC_PID:-}"
+    [ -z "$PID" ] && return 0
+    if ! _rsync_pid_running; then
+        wait "$PID" 2>/dev/null || true   # Reap imediato (já terminou = não bloqueia)
+        RSYNC_PID=""
+    fi
+    return 0
+}
+
+# ── abort_rsync_if_running ───────────────────────────────────────────────────
+# Mata o rsync em background IMEDIATAMENTE se estiver rodando.
+# Chamado no início de do_failover, do_failback e quando A é confirmado offline.
+# HA NUNCA espera rsync — rsync é sempre sacrificado em favor do HA.
+abort_rsync_if_running() {
+    _rsync_reap   # Limpa zombie se já terminou — evita abort desnecessário
+
+    if _rsync_pid_running; then
+        log_warn "RSYNC em background (PID ${RSYNC_PID}) — abortando para dar prioridade ao HA"
+        kill -TERM "$RSYNC_PID" 2>/dev/null || true
+        # Aguarda até 3s para encerrar graciosamente; força KILL se necessário
+        local _W=0
+        while _rsync_pid_running && [ $_W -lt 3 ]; do
+            sleep 1; _W=$((_W + 1))
+        done
+        kill -KILL "$RSYNC_PID" 2>/dev/null || true
+        wait "$RSYNC_PID" 2>/dev/null || true
+        log_warn "RSYNC abortado (PID ${RSYNC_PID}) — HA tem prioridade"
+        RSYNC_PID=""
+    fi
+    return 0
+}
+
+# Orquestrador principal — decide direção com base no papel atual de B.
+# SEMPRE lança o rsync em background (nunca bloqueia o loop de HA).
+# Se um rsync anterior ainda estiver rodando (não zombie), aguarda próximo ciclo.
+run_scheduled_rsync() {
+    # Recolhe rsync que terminou naturalmente antes de qualquer verificação
+    _rsync_reap
+
+    # Sai silenciosamente se não estiver na janela agendada
+    _is_rsync_schedule_now || return 0
+
+    # Se um rsync ainda estiver genuinamente rodando, não dispara outro
+    if _rsync_pid_running; then
+        log_info "RSYNC anterior (PID ${RSYNC_PID}) ainda em execucao — aguardando proximo ciclo"
+        return 0
+    fi
+
+    _mark_rsync_slot_done
+
+    local LOCAL_ROLE
+    LOCAL_ROLE=$(get_pg_state_local 2>/dev/null || echo "down")
+    log_info "RSYNC agendado ($(date '+%H:%M')) — papel de B: ${LOCAL_ROLE} — lancando em background"
+
+    case "$LOCAL_ROLE" in
+        replica)
+            # Operação normal — A é master, sincroniza A→B em background
+            do_rsync_a_to_b &
+            RSYNC_PID=$!
+            ;;
+        master)
+            # Failover ativo — B é master, sincroniza B→A em background se A online
+            if check_master_online 2>/dev/null; then
+                do_rsync_b_to_a &
+                RSYNC_PID=$!
+            else
+                log_warn "RSYNC agendado: B é master mas A (${MASTER_A_IP}) está offline — sync B→A adiado"
+            fi
+            ;;
+        down)
+            log_warn "RSYNC agendado: PostgreSQL local offline (state=down) — sync adiado"
+            ;;
+        *)
+            log_warn "RSYNC agendado: estado inesperado '${LOCAL_ROLE}' — sync abortado por seguranca"
+            ;;
+    esac
+
+    return 0
+}
+
+########################################
 # FAILBACK PRINCIPAL
 ########################################
 do_failback() {
+    # HA tem prioridade absoluta — mata rsync em background se estiver rodando
+    abort_rsync_if_running
     log "Iniciando FAILBACK — A volta como master, B vira slave"
     FAILBACK_START_TS=$(date +%s)
 
@@ -1043,6 +1375,14 @@ do_failback() {
 🕐 Horário: $(timestamp)"
 
     preflight_failback || return 1
+
+    # ── [0/6] RSYNC B→A — sincroniza arquivos de aplicação ANTES do failback ──
+    # Garante que A receba todas as alterações feitas em B durante o failover
+    # (configs Asterisk, sons, scripts /home/totalip etc.)
+    # Erros aqui NÃO abortam o failback — são loggados e notificados.
+    log "  [0/6] RSYNC B→A: sincronizando arquivos de aplicacao antes do failback..."
+    do_rsync_b_to_a
+    log_ok "  [0/6] RSYNC B→A pre-failback concluido (verifique ${RSYNC_LOG} se houve falhas)."
 
     setup_pgpass_local
     setup_pgpass_remote_a
@@ -1068,6 +1408,27 @@ do_failback() {
         rollback_failback; return 1
     fi
     log_ok "  [2/6] PGDATA em A limpo."
+
+    # ── Reconfigurar pgpass em A após limpeza do PGDATA ────────────────────
+    log "  [2.5/6] Reconfigurando pgpass em A apos limpeza..."
+    echo "*:*:*:${REPL_USER}:${REPL_PASSWORD}" | ssh_a "
+        cat > /tmp/pgpass_tmp
+        chown postgres:postgres /tmp/pgpass_tmp
+        chmod 600 /tmp/pgpass_tmp
+        mv /tmp/pgpass_tmp /var/lib/pgsql/.pgpass
+    " && log_ok "  [2.5/6] pgpass em A reconfigurado."       || log_warn "  [2.5/6] Falha ao reconfigurar pgpass em A (nao critico)."
+
+    # ── Garantir pg_hba.conf em B permite A conectar para replicação ──────
+    log "  [2.5/6] Garantindo pg_hba.conf em B para replicacao de A..."
+    local PG_HBA="$PGDATA/pg_hba.conf"
+    local HBA_ENTRY_A="host    replication     ${REPL_USER}    ${MASTER_A_IP}/32    md5"
+    if ! grep -qF "${MASTER_A_IP}/32" "$PG_HBA" 2>/dev/null; then
+        echo "$HBA_ENTRY_A" >> "$PG_HBA"
+        runuser -u postgres -- "$PG_BIN/pg_ctl" reload -D "$PGDATA" >> "$LOGFILE" 2>&1 || true
+        log_ok "  [2.5/6] Entrada de replicacao para A adicionada ao pg_hba.conf de B."
+    else
+        log_ok "  [2.5/6] pg_hba.conf de B ja permite replicacao de A."
+    fi
 
     log "  [3/6] pg_basebackup B -> A (timeout: ${BASEBACKUP_TIMEOUT}s)..."
     if ! ssh_a "sudo runuser -u postgres -- /bin/timeout $BASEBACKUP_TIMEOUT \
@@ -1144,10 +1505,19 @@ do_failback() {
     fi
     log_ok "  [6/6] B iniciado como slave."
 
+    # ── [6.5/6] RSYNC A→B — confirma paridade dos arquivos de aplicação ──────
+    # A agora é master autoritativo; sincroniza de volta para B garantindo
+    # que ambos ficam identicos após o failback completo.
+    log "  [6.5/6] RSYNC A→B: confirmando paridade de arquivos pos-failback..."
+    do_rsync_a_to_b
+    log_ok "  [6.5/6] RSYNC A→B pos-failback concluido (verifique ${RSYNC_LOG} se houve falhas)."
+
     pkill_if_recovery
     MASTER_HEALTH_COUNT=0
     SPLITBRAIN_PROTECTED=0
     DRG_ALERT_COUNT=0
+    RSYNC_LAST_SLOT=""   # Reset para permitir sync agendado no próximo ciclo
+    RSYNC_PID=""         # Reset — qualquer background já foi abortado no início do failback
     echo "$(timestamp)" > "$FLAG_FAILBACK"
     log_ok "FAILBACK concluido com sucesso"
 
@@ -1174,6 +1544,8 @@ do_failback() {
 # FAILOVER PRINCIPAL
 ########################################
 do_failover() {
+    # HA tem prioridade absoluta — mata rsync em background se estiver rodando
+    abort_rsync_if_running
     log "Promovendo B (${SLAVE_HOSTNAME}) para master..."
     ensure_postgres_running
 
@@ -1258,11 +1630,37 @@ log "  Max lag failover   : ${MAX_LAG_FOR_FAILOVER} bytes"
 log "  Max lag failback   : ${MAX_LAG_FOR_FAILBACK} bytes"
 log "  Health DB          : ${HEALTH_DB} (socket Unix)"
 log "  Env file           : ${ENV_FILE}"
+log "  RSYNC dry-run      : ${RSYNC_DRY_RUN} (0=real 1=simulacao)"
+log "  RSYNC schedule     : ${RSYNC_SCHEDULE_HOURS[*]} (janela ${RSYNC_WINDOW_MIN}min)"
+log "  RSYNC dirs         : ${RSYNC_DIRS[*]}"
 cleanup_old_db_backup
 
 LAST_STATE=$(get_pg_state_local)
 log "  Estado inicial de B: ${LAST_STATE}"
 pkill_if_recovery
+
+# ── RSYNC IMEDIATO AO INICIAR/REINICIAR ─────────────────────────────────────
+# Garante paridade dos arquivos de aplicação sempre que o script (re)sobe.
+# Roda em BACKGROUND — não atrasa o início do loop de HA.
+log "RSYNC inicial ao reiniciar script — verificando estado para decidir direcao..."
+case "$LAST_STATE" in
+    replica)
+        log_info "RSYNC inicial: B é réplica — sincronizando A→B (background)"
+        do_rsync_a_to_b &
+        RSYNC_PID=$!
+        ;;
+    master)
+        log_info "RSYNC inicial: B é master (failover ativo) — sincronizando B→A (background)"
+        do_rsync_b_to_a &
+        RSYNC_PID=$!
+        ;;
+    down)
+        log_warn "RSYNC inicial: PostgreSQL down no boot — sync adiado até próximo ciclo"
+        ;;
+    *)
+        log_warn "RSYNC inicial: estado desconhecido ('${LAST_STATE}') — sync adiado"
+        ;;
+esac
 
 while true; do
 
@@ -1388,6 +1786,10 @@ while true; do
         pkill_if_recovery
         LAST_STATE="$CURRENT_STATE"
     fi
+
+    # ── Verifica janela de sync agendado (06/13/17/22h) ─────────────────────
+    # Custo zero se fora da janela — apenas uma comparação de string
+    run_scheduled_rsync || true
 
     sleep "$CHECK_INTERVAL"
 done
